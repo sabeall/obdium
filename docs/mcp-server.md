@@ -55,6 +55,7 @@ claude mcp add obdium -- /absolute/path/to/target/release/obd-mcp
 
 | Tool | Description |
 | --- | --- |
+| `diagnose` | One-shot snapshot: reads trouble codes + live data together and returns them alongside the required answer structure (Diagnostics → Common Problems → NHTSA → Summary → Checklist). Start here for "what's wrong?". |
 | `list_serial_ports` | List serial ports with an ELM327 adapter (incl. paired Bluetooth). |
 | `connect` | Connect to a vehicle. `simulate=true` runs the coherent simulator (optional `scenario`); `demo=true` replays bundled sample data; otherwise connects to real hardware on `port`. Args: `port`, `baud_rate` (default 38400), `protocol` (0–9, 0=auto), `demo`, `simulate`, `scenario`. |
 | `disconnect` | Disconnect from the adapter. |
@@ -64,6 +65,28 @@ claude mcp add obdium -- /absolute/path/to/target/release/obd-mcp
 | `read_live_data` | Snapshot of live sensors (RPM, speed, coolant, load, throttle, fuel trims, MAF, intake, module voltage, …). Unsupported sensors report "no data". |
 | `read_vin` | Read the vehicle's VIN from the ECU. |
 | `known_issues` | Look up real recalls and owner complaints for a vehicle from **NHTSA** (US public data). Identify by `vin`, by `make`+`model`+`year`, or from the connected vehicle. Optional `component` filter. Requires network; results cached. |
+
+## Structured diagnostics
+
+So diagnostic answers come out consistently organized, the server does two
+things:
+
+- At `initialize` it returns an **`instructions`** string telling the client to
+  structure every diagnostic answer into these sections, in order:
+  **Diagnostics → Common Problems → NHTSA → Summary → Checklist** (the last as
+  actionable markdown checkboxes).
+- The **`diagnose`** tool bundles the trouble codes and live data in one call
+  and returns them next to that same section structure (`presentation.sections`),
+  so the model has a ready-made skeleton even if the client doesn't surface
+  `instructions`. It's the recommended starting point for "what's wrong?".
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"connect","arguments":{"simulate":true,"scenario":"overheat"}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"diagnose","arguments":{}}}' \
+  | target/release/obd-mcp
+```
 
 ## Known issues (NHTSA recalls & complaints)
 

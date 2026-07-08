@@ -25,6 +25,24 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "obdium-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Guidance surfaced to the MCP client at `initialize`, so every diagnostic
+/// answer is organized consistently. The `diagnose` tool returns the same
+/// structure inline with the data.
+const SERVER_INSTRUCTIONS: &str = "\
+When helping the user troubleshoot a vehicle, ALWAYS organize the answer into \
+these sections, in this exact order:\n\
+1. Diagnostics — interpret the live sensor data and trouble codes: what is \
+normal, what is abnormal, and what it points to.\n\
+2. Common Problems — the likely causes for this vehicle and code, ranked from \
+most to least likely.\n\
+3. NHTSA — real recalls and owner complaints for the vehicle. Call the \
+`known_issues` tool to get this; if it is unavailable, say so.\n\
+4. Summary — a short, plain-language conclusion the user can act on.\n\
+5. Checklist — an ordered, actionable checklist of what the user should do \
+next, written as markdown checkboxes (`- [ ] ...`).\n\
+The `diagnose` tool bundles the trouble codes and live data together with this \
+same section structure, so prefer it as the starting point for a diagnosis.";
+
 /// Server state: the real OBD adapter plus an optional coherent simulator.
 /// Exactly one is "connected" at a time; simulator mode short-circuits the
 /// hardware path so every read comes from the synthetic drive cycle instead.
@@ -162,7 +180,8 @@ fn handle(server: &mut Server, method: &str, params: Value, id: Option<Value>) -
         "initialize" => Some(Ok(json!({
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}
+            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            "instructions": SERVER_INSTRUCTIONS
         }))),
         "notifications/initialized" | "notifications/cancelled" => None,
         "ping" => Some(Ok(json!({}))),
@@ -178,6 +197,11 @@ fn handle(server: &mut Server, method: &str, params: Value, id: Option<Value>) -
 fn tool_definitions() -> Value {
     let empty = json!({"type": "object", "properties": {}});
     json!([
+        {
+            "name": "diagnose",
+            "description": "One-shot diagnostic snapshot: reads the trouble codes and live data together and returns them alongside the required answer structure (Diagnostics, Common Problems, NHTSA, Summary, Checklist). Prefer this as the starting point when the user asks what's wrong. Requires a connection (real, demo, or simulate).",
+            "inputSchema": empty
+        },
         {
             "name": "list_serial_ports",
             "description": "List serial ports that appear to have an ELM327 OBD-II adapter attached. A Bluetooth adapter shows up here once paired at the OS level.",
@@ -250,6 +274,7 @@ fn call_tool(server: &mut Server, params: Value) -> RpcResult {
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
 
     let result: Result<Value, String> = match name {
+        "diagnose" => tool_diagnose(server),
         "list_serial_ports" => Ok(tool_list_serial_ports()),
         "connect" => tool_connect(server, &args),
         "disconnect" => {
@@ -377,6 +402,35 @@ fn tool_status(server: &mut Server) -> Value {
         "protocol_number": obd.get_protocol_number(),
         "protocol_name": protocol,
     })
+}
+
+/// The required answer structure, returned inline with `diagnose` so the client
+/// organizes the response consistently even if it didn't read `instructions`.
+fn presentation_guide() -> Value {
+    json!({
+        "format": "Organize the answer to the user in these sections, in this order. Use markdown headings.",
+        "sections": [
+            {"heading": "Diagnostics", "content": "Interpret the live sensor data and trouble codes: what is normal, what is abnormal, and what it points to."},
+            {"heading": "Common Problems", "content": "The likely causes for this vehicle and code, ranked from most to least likely."},
+            {"heading": "NHTSA", "content": "Real recalls and owner complaints for the vehicle. Call the `known_issues` tool to populate this; if unavailable, say so."},
+            {"heading": "Summary", "content": "A short, plain-language conclusion the user can act on."},
+            {"heading": "Checklist", "content": "An ordered, actionable checklist of what the user should do next, written as markdown checkboxes (`- [ ] ...`)."}
+        ]
+    })
+}
+
+fn tool_diagnose(server: &mut Server) -> Result<Value, String> {
+    require_connection(server)?;
+    // Reuse the same readers so diagnose stays in lockstep with the individual
+    // tools (works in real, demo and simulate modes).
+    let trouble_codes = tool_read_trouble_codes(server)?;
+    let live_data = tool_read_live_data(server)?;
+    Ok(json!({
+        "trouble_codes": trouble_codes,
+        "live_data": live_data,
+        "presentation": presentation_guide(),
+        "hint": "For the NHTSA section, call `known_issues` (by VIN, make/model/year, or the connected vehicle).",
+    }))
 }
 
 fn trouble_code_json(code: &TroubleCode) -> Value {
@@ -624,6 +678,11 @@ mod tests {
         assert_eq!(res["protocolVersion"], json!(PROTOCOL_VERSION));
         assert_eq!(res["serverInfo"]["name"], json!(SERVER_NAME));
         assert!(res["capabilities"]["tools"].is_object());
+        // The presentation structure is surfaced to the client at handshake.
+        let instructions = res["instructions"].as_str().expect("instructions string");
+        for section in ["Diagnostics", "Common Problems", "NHTSA", "Summary", "Checklist"] {
+            assert!(instructions.contains(section), "instructions missing {section}");
+        }
     }
 
     #[test]
@@ -645,6 +704,7 @@ mod tests {
             .filter_map(|t| t["name"].as_str())
             .collect();
         for expected in [
+            "diagnose",
             "list_serial_ports",
             "connect",
             "disconnect",
@@ -682,6 +742,43 @@ mod tests {
     fn reading_before_connect_is_a_tool_error() {
         let mut server = Server::new();
         let params = json!({"name": "read_live_data", "arguments": {}});
+        let res = call_tool(&mut server, params).expect("tools/call replies");
+        assert_eq!(res["isError"], json!(true));
+        assert!(res["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Not connected"));
+    }
+
+    #[test]
+    fn diagnose_bundles_data_with_the_required_sections() {
+        let mut server = Server::new();
+        server.sim = Some(Simulator::new(Scenario::VacuumLeak));
+        let params = json!({"name": "diagnose", "arguments": {}});
+        let res = call_tool(&mut server, params).expect("tools/call replies");
+        assert_eq!(res["isError"], json!(false));
+        let report: Value =
+            serde_json::from_str(res["content"][0]["text"].as_str().unwrap()).unwrap();
+        // Bundles both data sources.
+        assert!(report["trouble_codes"]["current"].is_array());
+        assert!(report["live_data"]["engine_rpm"].is_object());
+        // Carries the required section order.
+        let headings: Vec<&str> = report["presentation"]["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["heading"].as_str())
+            .collect();
+        assert_eq!(
+            headings,
+            ["Diagnostics", "Common Problems", "NHTSA", "Summary", "Checklist"]
+        );
+    }
+
+    #[test]
+    fn diagnose_before_connect_is_a_tool_error() {
+        let mut server = Server::new();
+        let params = json!({"name": "diagnose", "arguments": {}});
         let res = call_tool(&mut server, params).expect("tools/call replies");
         assert_eq!(res["isError"], json!(true));
         assert!(res["content"][0]["text"]

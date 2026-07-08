@@ -226,6 +226,43 @@ fn simulate_vacuum_leak_sets_code_and_clearing_turns_it_off() {
 }
 
 #[test]
+fn initialize_advertises_the_answer_structure() {
+    let responses = run_session(&[json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
+    })]);
+    let instructions = by_id(&responses, 1)["result"]["instructions"]
+        .as_str()
+        .expect("instructions string");
+    for section in ["Diagnostics", "Common Problems", "NHTSA", "Summary", "Checklist"] {
+        assert!(instructions.contains(section), "missing {section}");
+    }
+}
+
+#[test]
+fn diagnose_bundles_codes_live_data_and_structure() {
+    let responses = run_session(&[
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": "connect", "arguments": {"simulate": true, "scenario": "overheat"}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+               "params": {"name": "diagnose", "arguments": {}}}),
+    ]);
+
+    let report = tool_json(by_id(&responses, 2));
+    assert!(report["trouble_codes"]["current"].is_array());
+    assert!(report["live_data"]["coolant_temp"].is_object());
+    let headings: Vec<&str> = report["presentation"]["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["heading"].as_str())
+        .collect();
+    assert_eq!(
+        headings,
+        ["Diagnostics", "Common Problems", "NHTSA", "Summary", "Checklist"]
+    );
+}
+
+#[test]
 fn simulate_rejects_unknown_scenario() {
     let responses = run_session(&[json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
