@@ -16,7 +16,9 @@ use obdium::scalar::{Scalar, Unit};
 use obdium::{BankNumber, OBD};
 use serde_json::{json, Value};
 
+mod known_issues;
 mod simulator;
+use known_issues::KnownIssues;
 use simulator::{Scenario, Simulator};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -29,6 +31,7 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 struct Server {
     obd: OBD,
     sim: Option<Simulator>,
+    known_issues: KnownIssues,
 }
 
 impl Server {
@@ -36,6 +39,7 @@ impl Server {
         Server {
             obd: OBD::new(),
             sim: None,
+            known_issues: KnownIssues::default(),
         }
     }
 
@@ -223,6 +227,20 @@ fn tool_definitions() -> Value {
             "name": "read_vin",
             "description": "Read the vehicle's VIN (Vehicle Identification Number) from the ECU.",
             "inputSchema": empty
+        },
+        {
+            "name": "known_issues",
+            "description": "Look up real recalls and owner complaints for a vehicle from NHTSA (US public data). Identify the vehicle by `vin`, by explicit `make`+`model`+`year`, or, if omitted, from the currently connected vehicle's VIN. Optional `component` substring filters complaints (e.g. \"engine\", \"fuel\"). Requires network access; results are cached. Great for pairing a live trouble code with known problems on that model.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "vin": {"type": "string", "description": "VIN to decode and look up. Optional if make/model/year given or a vehicle is connected."},
+                    "make": {"type": "string", "description": "Vehicle make, e.g. Toyota. Use with model+year to skip VIN decoding."},
+                    "model": {"type": "string", "description": "Vehicle model, e.g. 4Runner."},
+                    "year": {"type": "integer", "description": "Model year, e.g. 2013."},
+                    "component": {"type": "string", "description": "Optional case-insensitive filter for complaints/recalls, e.g. \"engine\" or \"fuel system\"."}
+                }
+            }
         }
     ])
 }
@@ -244,6 +262,7 @@ fn call_tool(server: &mut Server, params: Value) -> RpcResult {
         "clear_trouble_codes" => tool_clear_trouble_codes(server),
         "read_live_data" => tool_read_live_data(server),
         "read_vin" => tool_read_vin(server),
+        "known_issues" => tool_known_issues(server, &args),
         other => Err(format!("unknown tool: {other}")),
     };
 
@@ -508,6 +527,47 @@ fn tool_read_vin(server: &mut Server) -> Result<Value, String> {
     }
 }
 
+/// Simulated vehicles report this stable, valid-format VIN.
+const SIM_VIN: &str = "1HGCM82633A004352";
+
+fn tool_known_issues(server: &mut Server, args: &Value) -> Result<Value, String> {
+    let component = args.get("component").and_then(Value::as_str);
+
+    // 1. Prefer explicit make/model/year (no VIN decode / network needed for it).
+    let make = args.get("make").and_then(Value::as_str);
+    let model = args.get("model").and_then(Value::as_str);
+    let year = args
+        .get("year")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+
+    if let (Some(make), Some(model), Some(year)) = (make, model, year) {
+        return server.known_issues.lookup(make, model, year, component);
+    }
+
+    // 2. Otherwise we need a VIN: explicit arg, else the connected vehicle.
+    let vin = match args.get("vin").and_then(Value::as_str) {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => {
+            if server.sim.is_some() {
+                SIM_VIN.to_string()
+            } else if server.obd.is_connected() {
+                server
+                    .obd
+                    .get_vin()
+                    .map(|v| v.get_vin().to_string())
+                    .ok_or_else(|| "Connected, but could not read a VIN from the vehicle.".to_string())?
+            } else {
+                return Err("Provide `vin`, or `make`+`model`+`year`, or connect to a vehicle first.".into());
+            }
+        }
+    };
+
+    let vehicle = server.known_issues.decode_vin(&vin)?;
+    server
+        .known_issues
+        .lookup(&vehicle.make, &vehicle.model, vehicle.year, component)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,6 +653,7 @@ mod tests {
             "clear_trouble_codes",
             "read_live_data",
             "read_vin",
+            "known_issues",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -627,6 +688,19 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Not connected"));
+    }
+
+    #[test]
+    fn known_issues_without_vehicle_or_connection_is_a_tool_error() {
+        let mut server = Server::new();
+        // No vin, no make/model/year, not connected -> actionable error, no network.
+        let params = json!({"name": "known_issues", "arguments": {}});
+        let res = call_tool(&mut server, params).expect("tools/call replies");
+        assert_eq!(res["isError"], json!(true));
+        assert!(res["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Provide `vin`"));
     }
 
     #[test]

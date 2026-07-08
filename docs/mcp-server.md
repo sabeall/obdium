@@ -63,6 +63,48 @@ claude mcp add obdium -- /absolute/path/to/target/release/obd-mcp
 | `clear_trouble_codes` | Clear stored codes / turn off the check-engine light (service 04). **Destructive** — only on explicit request. |
 | `read_live_data` | Snapshot of live sensors (RPM, speed, coolant, load, throttle, fuel trims, MAF, intake, module voltage, …). Unsupported sensors report "no data". |
 | `read_vin` | Read the vehicle's VIN from the ECU. |
+| `known_issues` | Look up real recalls and owner complaints for a vehicle from **NHTSA** (US public data). Identify by `vin`, by `make`+`model`+`year`, or from the connected vehicle. Optional `component` filter. Requires network; results cached. |
+
+## Known issues (NHTSA recalls & complaints)
+
+The `known_issues` tool pairs a live diagnosis with real-world data: it pulls
+**recalls** and **owner complaints** for a specific vehicle from
+[NHTSA](https://www.nhtsa.gov) (US DOT public data, public domain, no API key).
+So when a live trouble code points at, say, the fuel system, you can ask *"what
+do owners of this exact model actually report?"*
+
+Identify the vehicle any of three ways:
+
+- `vin` — decoded to make/model/year via NHTSA vPIC, then looked up.
+- `make` + `model` + `year` — skips VIN decoding entirely.
+- nothing — uses the currently connected vehicle's VIN.
+
+An optional `component` argument case-insensitively filters complaints/recalls
+(e.g. `"engine"`, `"fuel system"`). The result summarizes recall campaigns and
+groups complaints by the most-reported component.
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"known_issues","arguments":{"make":"Toyota","model":"4Runner","year":2013,"component":"engine"}}}' \
+  | target/release/obd-mcp
+```
+
+**Notes and limitations:**
+
+- **Requires network access.** Responses are cached per URL for the life of the
+  process, so a repeated lookup works without re-hitting the network — but a
+  cold lookup with no connectivity will error.
+- **Transport:** this prototype shells out to `curl`. Productionizing would swap
+  in a Rust HTTP client (ureq/reqwest); the transport is behind a trait so tests
+  mock it and stay offline.
+- **VIN decoding is remote.** It uses the NHTSA vPIC *API* rather than the
+  bundled `vpic.sqlite.xz`, because the library decompresses that to a ~1.45 GB
+  local database at runtime, which the MCP crate doesn't ship. A fully offline
+  local decode could be wired in later behind the same interface.
+- **Full TSB (technical service bulletin) text is not open data** and is not
+  included; NHTSA exposes recalls and complaints, not the proprietary repair
+  procedures sold by ALLDATA/Mitchell1.
 
 ## Trying it without a car
 
@@ -132,7 +174,10 @@ the server — never the Tauri app. Two layers run:
   unknown methods), tool-level error handling, and the simulator model itself
   (readings stay in physical ranges across a drive cycle, the engine warms up,
   idle vs. cruise is coherent, and each fault scenario skews the right values
-  and sets the right code). No hardware or data files needed.
+  and sets the right code), and the `known_issues` lookup with a **mocked HTTP
+  client** (VIN decode, recall/complaint aggregation, component filtering, and
+  per-URL caching) so it never touches the network. No hardware or data files
+  needed.
 - **Integration tests** (`mcp/tests/mcp_server.rs`) spawn the real binary and
   drive it over stdio in demo and simulate modes. They assert that *every*
   emitted line is valid JSON — the regression guard ensuring the library's
