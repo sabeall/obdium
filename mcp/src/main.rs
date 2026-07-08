@@ -16,9 +16,11 @@ use obdium::scalar::{Scalar, Unit};
 use obdium::{BankNumber, OBD};
 use serde_json::{json, Value};
 
+mod dbc;
 mod known_issues;
 mod simulator;
-use known_issues::KnownIssues;
+use dbc::Dbc;
+use known_issues::{KnownIssues, Vehicle};
 use simulator::{Scenario, Simulator};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -265,6 +267,32 @@ fn tool_definitions() -> Value {
                     "component": {"type": "string", "description": "Optional case-insensitive filter for complaints/recalls, e.g. \"engine\" or \"fuel system\"."}
                 }
             }
+        },
+        {
+            "name": "dbc_signals",
+            "description": "List the manufacturer-specific CAN messages and signals defined in a DBC file (e.g. from commaai/opendbc) — data beyond the generic OBD-II PIDs. Provide the DBC via `dbc` (inline text) or `dbc_path` (file path). Optional `filter` matches message/signal names.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "dbc": {"type": "string", "description": "Inline DBC file contents."},
+                    "dbc_path": {"type": "string", "description": "Path to a .dbc file (e.g. an opendbc platform file)."},
+                    "filter": {"type": "string", "description": "Optional case-insensitive substring to filter message/signal names."}
+                }
+            }
+        },
+        {
+            "name": "decode_can",
+            "description": "Decode a raw CAN frame into physical signal values using a DBC file (e.g. from commaai/opendbc). Useful for manufacturer-specific signals not exposed as generic OBD-II PIDs. Provide the DBC via `dbc` or `dbc_path`, plus `can_id` (number or hex) and `data` (hex payload). Note: this decodes a frame you supply; it does not sniff the CAN bus itself.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "dbc": {"type": "string", "description": "Inline DBC file contents."},
+                    "dbc_path": {"type": "string", "description": "Path to a .dbc file (e.g. an opendbc platform file)."},
+                    "can_id": {"description": "CAN arbitration id, as a number or hex string like \"0x2E4\"."},
+                    "data": {"type": "string", "description": "CAN payload as hex, e.g. \"0F A0 00 00 00 00 00 00\"."}
+                },
+                "required": ["can_id", "data"]
+            }
         }
     ])
 }
@@ -288,6 +316,8 @@ fn call_tool(server: &mut Server, params: Value) -> RpcResult {
         "read_live_data" => tool_read_live_data(server),
         "read_vin" => tool_read_vin(server),
         "known_issues" => tool_known_issues(server, &args),
+        "dbc_signals" => tool_dbc_signals(&args),
+        "decode_can" => tool_decode_can(&args),
         other => Err(format!("unknown tool: {other}")),
     };
 
@@ -595,7 +625,8 @@ fn tool_known_issues(server: &mut Server, args: &Value) -> Result<Value, String>
         .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
 
     if let (Some(make), Some(model), Some(year)) = (make, model, year) {
-        return server.known_issues.lookup(make, model, year, component);
+        let vehicle = Vehicle::basic(make, model, year);
+        return server.known_issues.lookup(&vehicle, component);
     }
 
     // 2. Otherwise we need a VIN: explicit arg, else the connected vehicle.
@@ -617,9 +648,121 @@ fn tool_known_issues(server: &mut Server, args: &Value) -> Result<Value, String>
     };
 
     let vehicle = server.known_issues.decode_vin(&vin)?;
-    server
-        .known_issues
-        .lookup(&vehicle.make, &vehicle.model, vehicle.year, component)
+    server.known_issues.lookup(&vehicle, component)
+}
+
+// --- opendbc: CAN signal decoding --------------------------------------------
+
+fn load_dbc_text(args: &Value) -> Result<String, String> {
+    if let Some(t) = args.get("dbc").and_then(Value::as_str) {
+        if !t.trim().is_empty() {
+            return Ok(t.to_string());
+        }
+    }
+    if let Some(p) = args.get("dbc_path").and_then(Value::as_str) {
+        return std::fs::read_to_string(p)
+            .map_err(|e| format!("failed to read dbc file `{p}`: {e}"));
+    }
+    Err("Provide `dbc` (inline DBC text) or `dbc_path` (path to a .dbc file, e.g. from opendbc).".into())
+}
+
+fn parse_can_id(v: &Value) -> Result<u32, String> {
+    if let Some(n) = v.as_u64() {
+        return Ok(n as u32);
+    }
+    if let Some(s) = v.as_str() {
+        let s = s.trim();
+        return if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            u32::from_str_radix(hex, 16).map_err(|_| format!("invalid hex can_id `{s}`"))
+        } else {
+            s.parse::<u32>().map_err(|_| format!("invalid can_id `{s}`"))
+        };
+    }
+    Err("`can_id` must be a number or a hex string like \"0x2E4\".".into())
+}
+
+fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != ':' && *c != ',')
+        .collect();
+    let cleaned = cleaned.strip_prefix("0x").unwrap_or(&cleaned);
+    if cleaned.len() % 2 != 0 {
+        return Err("hex `data` must have an even number of digits.".into());
+    }
+    (0..cleaned.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&cleaned[i..i + 2], 16)
+                .map_err(|_| format!("invalid hex byte `{}`", &cleaned[i..i + 2]))
+        })
+        .collect()
+}
+
+fn tool_decode_can(args: &Value) -> Result<Value, String> {
+    let dbc = Dbc::parse(&load_dbc_text(args)?);
+    let can_id = parse_can_id(
+        args.get("can_id")
+            .ok_or("`can_id` is required (number or hex string).")?,
+    )?;
+    let data_str = args
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or("`data` (hex payload, e.g. \"0F A0 00 ...\") is required.")?;
+    let data = parse_hex_bytes(data_str)?;
+
+    match dbc.decode(can_id, &data) {
+        Some(signals) => Ok(json!({
+            "can_id": format!("0x{can_id:X}"),
+            "signals": signals.iter().map(|s| json!({
+                "name": s.name,
+                "value": s.value,
+                "unit": s.unit,
+                "raw": s.raw,
+            })).collect::<Vec<_>>(),
+        })),
+        None => Err(format!(
+            "no message with arbitration id 0x{can_id:X} in the provided DBC."
+        )),
+    }
+}
+
+fn tool_dbc_signals(args: &Value) -> Result<Value, String> {
+    let dbc = Dbc::parse(&load_dbc_text(args)?);
+    let filter = args
+        .get("filter")
+        .and_then(Value::as_str)
+        .map(|s| s.to_lowercase());
+
+    let messages: Vec<Value> = dbc
+        .messages
+        .iter()
+        .filter(|m| match &filter {
+            None => true,
+            Some(f) => {
+                m.name.to_lowercase().contains(f)
+                    || m.signals.iter().any(|s| s.name.to_lowercase().contains(f))
+            }
+        })
+        .map(|m| {
+            json!({
+                "id": format!("0x{:X}", m.arbitration_id()),
+                "name": m.name,
+                "extended": m.extended(),
+                "signals": m.signals.iter().map(|s| json!({
+                    "name": s.name,
+                    "unit": s.unit,
+                    "bits": format!("{}|{}", s.start_bit, s.length),
+                    "endian": if s.little_endian { "little" } else { "big" },
+                    "signed": s.signed,
+                    "factor": s.factor,
+                    "offset": s.offset,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    Ok(json!({"message_count": messages.len(), "messages": messages}))
 }
 
 #[cfg(test)]
@@ -714,6 +857,8 @@ mod tests {
             "read_live_data",
             "read_vin",
             "known_issues",
+            "dbc_signals",
+            "decode_can",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -798,6 +943,45 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Provide `vin`"));
+    }
+
+    #[test]
+    fn decode_can_decodes_a_frame_from_inline_dbc() {
+        let mut server = Server::new();
+        let dbc = "BO_ 200 ENGINE: 8 ECU\n SG_ RPM : 7|16@0+ (0.25,0) [0|16383] \"rpm\" X\n";
+        let params = json!({"name": "decode_can", "arguments": {
+            "dbc": dbc, "can_id": "0xC8", "data": "0F A0 00 00 00 00 00 00"
+        }});
+        let res = call_tool(&mut server, params).expect("tools/call replies");
+        assert_eq!(res["isError"], json!(false));
+        let out: Value =
+            serde_json::from_str(res["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(out["signals"][0]["name"], json!("RPM"));
+        assert_eq!(out["signals"][0]["value"], json!(1000.0));
+        assert_eq!(out["signals"][0]["unit"], json!("rpm"));
+    }
+
+    #[test]
+    fn decode_can_without_a_dbc_is_a_tool_error() {
+        let mut server = Server::new();
+        let params = json!({"name": "decode_can", "arguments": {"can_id": 200, "data": "00"}});
+        let res = call_tool(&mut server, params).expect("tools/call replies");
+        assert_eq!(res["isError"], json!(true));
+        assert!(res["content"][0]["text"].as_str().unwrap().contains("Provide `dbc`"));
+    }
+
+    #[test]
+    fn dbc_signals_lists_messages() {
+        let mut server = Server::new();
+        let dbc = "BO_ 100 SPEED: 8 ECU\n SG_ VEHICLE_SPEED : 0|8@1+ (1,0) [0|255] \"km/h\" X\n";
+        let params = json!({"name": "dbc_signals", "arguments": {"dbc": dbc}});
+        let res = call_tool(&mut server, params).expect("tools/call replies");
+        assert_eq!(res["isError"], json!(false));
+        let out: Value =
+            serde_json::from_str(res["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(out["message_count"], json!(1));
+        assert_eq!(out["messages"][0]["name"], json!("SPEED"));
+        assert_eq!(out["messages"][0]["signals"][0]["name"], json!("VEHICLE_SPEED"));
     }
 
     #[test]

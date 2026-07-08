@@ -64,7 +64,9 @@ claude mcp add obdium -- /absolute/path/to/target/release/obd-mcp
 | `clear_trouble_codes` | Clear stored codes / turn off the check-engine light (service 04). **Destructive** — only on explicit request. |
 | `read_live_data` | Snapshot of live sensors (RPM, speed, coolant, load, throttle, fuel trims, MAF, intake, module voltage, …). Unsupported sensors report "no data". |
 | `read_vin` | Read the vehicle's VIN from the ECU. |
-| `known_issues` | Look up real recalls and owner complaints for a vehicle from **NHTSA** (US public data). Identify by `vin`, by `make`+`model`+`year`, or from the connected vehicle. Optional `component` filter. Requires network; results cached. |
+| `known_issues` | Look up real recalls and owner complaints for a vehicle from **NHTSA** (US public data). Identify by `vin`, by `make`+`model`+`year`, or from the connected vehicle. A decoded VIN also returns richer vPIC attributes (engine, cylinders, displacement, fuel, drive, body). Optional `component` filter. Requires network; results cached. |
+| `dbc_signals` | List the manufacturer-specific CAN messages/signals in a DBC file (e.g. from [opendbc](https://github.com/commaai/opendbc)). Provide `dbc` (inline) or `dbc_path`; optional `filter`. |
+| `decode_can` | Decode a raw CAN frame (`can_id` + `data` hex) into physical signal values using a DBC file. Decodes a frame you supply; does not sniff the bus. |
 
 ## Structured diagnostics
 
@@ -98,7 +100,11 @@ do owners of this exact model actually report?"*
 
 Identify the vehicle any of three ways:
 
-- `vin` — decoded to make/model/year via NHTSA vPIC, then looked up.
+- `vin` — decoded via NHTSA vPIC, then looked up. Decoding also returns richer
+  attributes (engine model, cylinder count, displacement, fuel type, drive,
+  body class), so a diagnosis can reason about the actual engine (e.g. a 4.0L
+  V6 with two sensor banks). Cylinder count alone can't tell inline from V, so a
+  `bank_hint` is provided rather than an over-confident claim.
 - `make` + `model` + `year` — skips VIN decoding entirely.
 - nothing — uses the currently connected vehicle's VIN.
 
@@ -128,6 +134,34 @@ printf '%s\n' \
 - **Full TSB (technical service bulletin) text is not open data** and is not
   included; NHTSA exposes recalls and complaints, not the proprietary repair
   procedures sold by ALLDATA/Mitchell1.
+
+## Manufacturer CAN signals (opendbc)
+
+Generic OBD-II PIDs only expose a standard subset of data. Vehicle makers
+broadcast far more on their CAN bus, described by **DBC files** — and
+[commaai/opendbc](https://github.com/commaai/opendbc) (MIT-licensed) publishes
+reverse-engineered DBCs for many platforms, including Toyota.
+
+Two tools use that data format:
+
+- **`dbc_signals`** — parse a DBC and list its messages/signals, so you can see
+  what a platform exposes beyond OBD-II.
+- **`decode_can`** — decode a raw CAN frame into physical values using the DBC
+  (little/big-endian, signed, scale/offset all handled).
+
+```bash
+# List the steering-related signals a DBC defines:
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"dbc_signals","arguments":{"dbc_path":"/path/to/opendbc/toyota_something.dbc","filter":"steer"}}}' \
+  | target/release/obd-mcp
+```
+
+**Scope / limitation:** these tools do the *data-format* half — parsing DBCs and
+decoding a frame **you provide** (e.g. captured via an ELM327 monitor mode or a
+dedicated CAN tool). The server itself speaks OBD-II request/response and does
+**not** passively sniff the CAN bus; live raw-CAN capture would be a larger
+change to the underlying transport.
 
 ## Trying it without a car
 

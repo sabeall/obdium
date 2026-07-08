@@ -54,6 +54,64 @@ pub struct Vehicle {
     pub make: String,
     pub model: String,
     pub year: i64,
+    pub cylinders: Option<i64>,
+    pub displacement_l: Option<f64>,
+    pub fuel_type: Option<String>,
+    pub drive_type: Option<String>,
+    pub body_class: Option<String>,
+    pub engine_model: Option<String>,
+}
+
+impl Vehicle {
+    /// A vehicle known only by make/model/year (e.g. supplied directly, without
+    /// a VIN to decode the richer attributes from).
+    pub fn basic(make: impl Into<String>, model: impl Into<String>, year: i64) -> Self {
+        Self {
+            make: make.into(),
+            model: model.into(),
+            year,
+            cylinders: None,
+            displacement_l: None,
+            fuel_type: None,
+            drive_type: None,
+            body_class: None,
+            engine_model: None,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let mut v = json!({"make": self.make, "model": self.model, "year": self.year});
+        let obj = v.as_object_mut().unwrap();
+        if let Some(c) = self.cylinders {
+            obj.insert("cylinders".into(), json!(c));
+            // Heuristic bank hint: cylinders alone can't distinguish inline from
+            // V, so 6 is genuinely ambiguous.
+            let hint = if c >= 8 {
+                "2"
+            } else if c <= 4 {
+                "1"
+            } else {
+                "1 (inline) or 2 (V) — check engine layout"
+            };
+            obj.insert("bank_hint".into(), json!(hint));
+        }
+        if let Some(d) = self.displacement_l {
+            obj.insert("displacement_l".into(), json!(d));
+        }
+        if let Some(f) = &self.fuel_type {
+            obj.insert("fuel_type".into(), json!(f));
+        }
+        if let Some(d) = &self.drive_type {
+            obj.insert("drive_type".into(), json!(d));
+        }
+        if let Some(b) = &self.body_class {
+            obj.insert("body_class".into(), json!(b));
+        }
+        if let Some(e) = &self.engine_model {
+            obj.insert("engine_model".into(), json!(e));
+        }
+        v
+    }
 }
 
 pub struct KnownIssues {
@@ -108,29 +166,34 @@ impl KnownIssues {
                 "vPIC could not fully decode VIN `{vin}` (make/model/year incomplete)"
             ));
         }
-        Ok(Vehicle { make, model, year })
+
+        Ok(Vehicle {
+            make,
+            model,
+            year,
+            cylinders: str_field(r, &["EngineCylinders"]).and_then(|s| s.parse().ok()),
+            displacement_l: str_field(r, &["DisplacementL"]).and_then(|s| s.parse().ok()),
+            fuel_type: str_field(r, &["FuelTypePrimary"]),
+            drive_type: str_field(r, &["DriveType"]),
+            body_class: str_field(r, &["BodyClass"]),
+            engine_model: str_field(r, &["EngineModel"]),
+        })
     }
 
     /// Fetch and summarize recalls + complaints for a vehicle. `component` is an
     /// optional case-insensitive substring filter (e.g. "engine", "fuel").
-    pub fn lookup(
-        &mut self,
-        make: &str,
-        model: &str,
-        year: i64,
-        component: Option<&str>,
-    ) -> Result<Value, String> {
+    pub fn lookup(&mut self, vehicle: &Vehicle, component: Option<&str>) -> Result<Value, String> {
         let recalls_url = format!(
             "https://api.nhtsa.gov/recalls/recallsByVehicle?make={}&model={}&modelYear={}",
-            enc(make),
-            enc(model),
-            year
+            enc(&vehicle.make),
+            enc(&vehicle.model),
+            vehicle.year
         );
         let complaints_url = format!(
             "https://api.nhtsa.gov/complaints/complaintsByVehicle?make={}&model={}&modelYear={}",
-            enc(make),
-            enc(model),
-            year
+            enc(&vehicle.make),
+            enc(&vehicle.model),
+            vehicle.year
         );
 
         let (recalls_body, r_cached) = self.get_cached(&recalls_url)?;
@@ -140,7 +203,7 @@ impl KnownIssues {
         let complaints = summarize_complaints(&complaints_body, component);
 
         Ok(json!({
-            "vehicle": {"make": make, "model": model, "year": year},
+            "vehicle": vehicle.to_json(),
             "recalls": recalls,
             "complaints": complaints,
             "filter": component,
@@ -291,7 +354,11 @@ mod tests {
             self.calls.borrow_mut().push(url.to_string());
             if url.contains("DecodeVinValues") {
                 Ok(json!({"Results": [{
-                    "Make": "TOYOTA", "Model": "4Runner", "ModelYear": "2013"
+                    "Make": "TOYOTA", "Model": "4Runner", "ModelYear": "2013",
+                    "EngineCylinders": "6", "DisplacementL": "4.0",
+                    "FuelTypePrimary": "Gasoline", "DriveType": "4WD",
+                    "BodyClass": "Sport Utility Vehicle (SUV)/Multi-Purpose Vehicle (MPV)",
+                    "EngineModel": "1GR-FE"
                 }]}))
             } else if url.contains("recallsByVehicle") {
                 Ok(json!({"Count": 1, "results": [{
@@ -321,18 +388,34 @@ mod tests {
     }
 
     #[test]
-    fn decodes_vin_to_make_model_year() {
+    fn decodes_vin_with_richer_attributes() {
         let mut k = ki();
         let v = k.decode_vin("JTEBU5JR0D5123456").unwrap();
         assert_eq!(v.make, "TOYOTA");
         assert_eq!(v.model, "4Runner");
         assert_eq!(v.year, 2013);
+        assert_eq!(v.cylinders, Some(6));
+        assert_eq!(v.displacement_l, Some(4.0));
+        assert_eq!(v.fuel_type.as_deref(), Some("Gasoline"));
+        assert_eq!(v.engine_model.as_deref(), Some("1GR-FE"));
+    }
+
+    #[test]
+    fn lookup_surfaces_vehicle_attributes_from_a_decoded_vin() {
+        let mut k = ki();
+        let v = k.decode_vin("JTEBU5JR0D5123456").unwrap();
+        let out = k.lookup(&v, None).unwrap();
+        assert_eq!(out["vehicle"]["cylinders"], json!(6));
+        assert_eq!(out["vehicle"]["displacement_l"], json!(4.0));
+        assert_eq!(out["vehicle"]["engine_model"], json!("1GR-FE"));
+        // 6 cylinders is ambiguous between inline and V.
+        assert!(out["vehicle"]["bank_hint"].as_str().unwrap().contains("V"));
     }
 
     #[test]
     fn lookup_aggregates_recalls_and_complaints() {
         let mut k = ki();
-        let out = k.lookup("TOYOTA", "4Runner", 2013, None).unwrap();
+        let out = k.lookup(&Vehicle::basic("TOYOTA", "4Runner", 2013), None).unwrap();
         assert_eq!(out["recalls"]["count"], json!(1));
         assert_eq!(out["recalls"]["items"][0]["campaign"], json!("13V001000"));
         assert_eq!(out["complaints"]["count"], json!(3));
@@ -344,7 +427,9 @@ mod tests {
     #[test]
     fn component_filter_narrows_complaints() {
         let mut k = ki();
-        let out = k.lookup("TOYOTA", "4Runner", 2013, Some("engine")).unwrap();
+        let out = k
+            .lookup(&Vehicle::basic("TOYOTA", "4Runner", 2013), Some("engine"))
+            .unwrap();
         // Only the two ENGINE complaints survive; the electrical one is filtered.
         assert_eq!(out["complaints"]["count"], json!(2));
         assert_eq!(out["filter"], json!("engine"));
@@ -352,14 +437,12 @@ mod tests {
 
     #[test]
     fn responses_are_cached_per_url() {
-        let mock = MockHttp::new();
-        let mut k = KnownIssues::with_client(Box::new(mock));
-        let _ = k.lookup("TOYOTA", "4Runner", 2013, None).unwrap();
-        let second = k.lookup("TOYOTA", "4Runner", 2013, None).unwrap();
+        let mut k = KnownIssues::with_client(Box::new(MockHttp::new()));
+        let _ = k.lookup(&Vehicle::basic("TOYOTA", "4Runner", 2013), None).unwrap();
+        let second = k.lookup(&Vehicle::basic("TOYOTA", "4Runner", 2013), None).unwrap();
         assert_eq!(second["from_cache"], json!(true));
-        // The mock is moved into the client, so assert via cache behavior:
-        // a fresh lookup of a *different* year would not be cached.
-        let third = k.lookup("TOYOTA", "4Runner", 2014, None).unwrap();
+        // A fresh lookup of a *different* year would not be cached.
+        let third = k.lookup(&Vehicle::basic("TOYOTA", "4Runner", 2014), None).unwrap();
         assert_eq!(third["from_cache"], json!(false));
     }
 
