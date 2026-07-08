@@ -1,0 +1,17 @@
+[package]
+name = "obd-mcp"
+version = "1.5.0"
+edition = "2021"
+
+[[bin]]
+name = "obd-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# The pure OBD-II library. Its lib target does not use Tauri, so building this
+# crate does not pull in the desktop app or its build script.
+obdium = { path = "../backend" }
+serde_json = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
