@@ -81,6 +81,12 @@ things:
   and returns them next to that same section structure (`presentation.sections`),
   so the model has a ready-made skeleton even if the client doesn't surface
   `instructions`. It's the recommended starting point for "what's wrong?".
+- `diagnose` also returns a ready-to-render **`chart`** (columns
+  `Parameter | Value | Status`) so the readings display as a compact table
+  instead of raw JSON. The `Status` column carries at-a-glance flags only for
+  values that can be judged universally — fuel trims (lean/rich), charging
+  voltage, and coolant over-temp — and is left blank elsewhere so nothing is
+  over-claimed.
 
 ```bash
 printf '%s\n' \

@@ -440,12 +440,97 @@ fn presentation_guide() -> Value {
     json!({
         "format": "Organize the answer to the user in these sections, in this order. Use markdown headings.",
         "sections": [
-            {"heading": "Diagnostics", "content": "Interpret the live sensor data and trouble codes: what is normal, what is abnormal, and what it points to."},
+            {"heading": "Diagnostics", "content": "Render the provided `chart` (Parameter | Value | Status) as a markdown table so it is easy to read, then interpret it and the trouble codes: what is normal, what is abnormal (see the Status column), and what it points to. Also show the trouble codes as a small table (Code | Description)."},
             {"heading": "Common Problems", "content": "The likely causes for this vehicle and code, ranked from most to least likely."},
             {"heading": "NHTSA", "content": "Real recalls and owner complaints for the vehicle. Call the `known_issues` tool to populate this; if unavailable, say so."},
             {"heading": "Summary", "content": "A short, plain-language conclusion the user can act on."},
             {"heading": "Checklist", "content": "An ordered, actionable checklist of what the user should do next, written as markdown checkboxes (`- [ ] ...`)."}
         ]
+    })
+}
+
+/// Human labels for live-data keys, in the order they should appear in the
+/// chart. Keeps the chart readable and stable.
+const LIVE_DATA_LABELS: &[(&str, &str)] = &[
+    ("engine_rpm", "Engine RPM"),
+    ("vehicle_speed", "Vehicle speed"),
+    ("engine_load", "Engine load"),
+    ("coolant_temp", "Coolant temp"),
+    ("intake_air_temp", "Intake air temp"),
+    ("ambient_air_temp", "Ambient air temp"),
+    ("intake_manifold_pressure", "Intake MAP"),
+    ("maf_air_flow_rate", "MAF airflow"),
+    ("throttle_position", "Throttle"),
+    ("timing_advance", "Timing advance"),
+    ("short_term_fuel_trim_bank1", "Short-term fuel trim (B1)"),
+    ("long_term_fuel_trim_bank1", "Long-term fuel trim (B1)"),
+    ("short_term_fuel_trim_bank2", "Short-term fuel trim (B2)"),
+    ("long_term_fuel_trim_bank2", "Long-term fuel trim (B2)"),
+    ("fuel_tank_level", "Fuel level"),
+    ("control_module_voltage", "Module voltage"),
+    ("engine_runtime", "Engine runtime"),
+];
+
+/// An at-a-glance status for a reading — only for values that can be judged
+/// universally (independent of vehicle/engine state). Everything else is left
+/// blank so we don't over-claim; the model interprets those in prose.
+fn classify_reading(key: &str, value: f64) -> String {
+    if key.contains("fuel_trim") {
+        let a = value.abs();
+        if a <= 10.0 {
+            "ok".into()
+        } else {
+            let dir = if value > 0.0 { "lean" } else { "rich" };
+            if a > 25.0 {
+                format!("⚠ very {dir}")
+            } else {
+                format!("⚠ high — {dir}")
+            }
+        }
+    } else if key == "control_module_voltage" {
+        if value < 13.0 {
+            "⚠ low (charging?)".into()
+        } else if value > 15.0 {
+            "⚠ high".into()
+        } else {
+            "ok".into()
+        }
+    } else if key == "coolant_temp" && value >= 110.0 {
+        "⚠ overheating".into()
+    } else {
+        String::new()
+    }
+}
+
+/// Build a readable chart (Parameter | Value | Status) from a live-data object.
+fn live_data_chart(live: &Value) -> Value {
+    let rows: Vec<Value> = LIVE_DATA_LABELS
+        .iter()
+        .filter_map(|(key, label)| {
+            let reading = live.get(*key)?;
+            let available = reading.get("available").and_then(Value::as_bool).unwrap_or(false);
+            let (value, status) = if available {
+                let display = reading
+                    .get("display")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let status = reading
+                    .get("value")
+                    .and_then(Value::as_f64)
+                    .map(|v| classify_reading(key, v))
+                    .unwrap_or_default();
+                (display, status)
+            } else {
+                ("NO DATA".to_string(), "n/a".to_string())
+            };
+            Some(json!({"parameter": label, "value": value, "status": status}))
+        })
+        .collect();
+
+    json!({
+        "columns": ["Parameter", "Value", "Status"],
+        "rows": rows,
     })
 }
 
@@ -455,9 +540,11 @@ fn tool_diagnose(server: &mut Server) -> Result<Value, String> {
     // tools (works in real, demo and simulate modes).
     let trouble_codes = tool_read_trouble_codes(server)?;
     let live_data = tool_read_live_data(server)?;
+    let chart = live_data_chart(&live_data);
     Ok(json!({
         "trouble_codes": trouble_codes,
         "live_data": live_data,
+        "chart": chart,
         "presentation": presentation_guide(),
         "hint": "For the NHTSA section, call `known_issues` (by VIN, make/model/year, or the connected vehicle).",
     }))
@@ -907,6 +994,18 @@ mod tests {
         // Bundles both data sources.
         assert!(report["trouble_codes"]["current"].is_array());
         assert!(report["live_data"]["engine_rpm"].is_object());
+        // Includes a readable chart with the expected columns and rows.
+        assert_eq!(
+            report["chart"]["columns"],
+            json!(["Parameter", "Value", "Status"])
+        );
+        let rows = report["chart"]["rows"].as_array().expect("chart rows");
+        assert!(rows.iter().any(|r| r["parameter"] == json!("Engine RPM")));
+        // Vacuum leak drives fuel trims lean, so at least one row is flagged.
+        assert!(
+            rows.iter().any(|r| r["status"].as_str().is_some_and(|s| s.contains("lean"))),
+            "expected a lean fuel-trim status flag in the chart"
+        );
         // Carries the required section order.
         let headings: Vec<&str> = report["presentation"]["sections"]
             .as_array()
@@ -918,6 +1017,18 @@ mod tests {
             headings,
             ["Diagnostics", "Common Problems", "NHTSA", "Summary", "Checklist"]
         );
+    }
+
+    #[test]
+    fn reading_classification_flags_are_universal() {
+        assert_eq!(classify_reading("short_term_fuel_trim_bank1", 3.0), "ok");
+        assert!(classify_reading("long_term_fuel_trim_bank1", 22.0).contains("lean"));
+        assert!(classify_reading("short_term_fuel_trim_bank1", -30.0).contains("very rich"));
+        assert!(classify_reading("control_module_voltage", 12.1).contains("low"));
+        assert!(classify_reading("coolant_temp", 119.0).contains("overheating"));
+        // No universal judgment for these -> blank.
+        assert_eq!(classify_reading("engine_rpm", 3000.0), "");
+        assert_eq!(classify_reading("vehicle_speed", 60.0), "");
     }
 
     #[test]
