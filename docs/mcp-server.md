@@ -56,7 +56,7 @@ claude mcp add obdium -- /absolute/path/to/target/release/obd-mcp
 | Tool | Description |
 | --- | --- |
 | `list_serial_ports` | List serial ports with an ELM327 adapter (incl. paired Bluetooth). |
-| `connect` | Connect to a port. `demo=true` replays bundled sample data — no hardware needed. Args: `port`, `baud_rate` (default 38400), `protocol` (0–9, 0=auto), `demo`. |
+| `connect` | Connect to a vehicle. `simulate=true` runs the coherent simulator (optional `scenario`); `demo=true` replays bundled sample data; otherwise connects to real hardware on `port`. Args: `port`, `baud_rate` (default 38400), `protocol` (0–9, 0=auto), `demo`, `simulate`, `scenario`. |
 | `disconnect` | Disconnect from the adapter. |
 | `status` | Connection status, port, baud rate and active OBD-II protocol. |
 | `read_trouble_codes` | Stored, permanent and freeze-frame DTCs with plain-language descriptions, plus check-engine (MIL) state. |
@@ -66,7 +66,49 @@ claude mcp add obdium -- /absolute/path/to/target/release/obd-mcp
 
 ## Trying it without a car
 
-You can exercise the whole pipeline against recorded sample data:
+There are two hardware-free modes, for two different jobs.
+
+### Simulator mode (recommended)
+
+`simulate=true` runs a **coherent vehicle simulator**: a synthetic drive cycle
+where the engine warms up from cold, idles, accelerates, cruises and
+decelerates on a loop, and every sensor is derived from that shared state — so
+RPM tracks speed and gear, MAF tracks RPM and load, MAP tracks throttle, and
+the coolant climbs smoothly to operating temperature. Poll `read_live_data`
+repeatedly and you get a believable, evolving picture rather than random noise.
+
+It can also inject a **fault scenario** via the `scenario` argument, which skews
+the relevant live values *and* reports a matching trouble code with the
+check-engine light on — ideal for practising a troubleshooting flow:
+
+| `scenario` | What it simulates |
+| --- | --- |
+| `healthy` (default) | Everything nominal, no codes, MIL off. |
+| `vacuum_leak` | Large positive fuel trims (lean), worst at idle. Sets `P0171`. |
+| `misfire` | RPM jitter and erratic short-term fuel trim. Sets `P0300`/`P0301`. |
+| `overheat` | Coolant climbs past the normal range into the red. Sets `P0217`. |
+
+`clear_trouble_codes` clears the fault and turns the light off, just like a real
+ECU.
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"connect","arguments":{"simulate":true,"scenario":"vacuum_leak"}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_live_data","arguments":{}}}' \
+  '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read_trouble_codes","arguments":{}}}' \
+  | target/release/obd-mcp
+```
+
+Or in Claude Code, just ask it to *"connect in simulate mode with a vacuum leak
+and help me diagnose it."*
+
+### Demo mode
+
+`demo=true` replays OBDium's **recorded sample responses**. Each read returns a
+random recorded value for that PID, so the numbers are real but not physically
+coherent between sensors or over time. It's best for exercising the raw
+protocol/decoding path rather than for a realistic drive:
 
 ```bash
 printf '%s\n' \
@@ -75,8 +117,6 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_live_data","arguments":{}}}' \
   | target/release/obd-mcp
 ```
-
-Or in Claude Code, just ask it to connect in demo mode and read the live data.
 
 ## Testing
 
@@ -87,14 +127,19 @@ cargo test -p obd-mcp
 Because `obd-mcp` is its own crate, this builds only the `obdium` library and
 the server — never the Tauri app. Two layers run:
 
-- **Unit tests** (`mcp/src/main.rs`) cover reading serialization, JSON-RPC
-  dispatch (initialize, `tools/list`, notifications, unknown methods) and
-  tool-level error handling. No hardware or data files needed.
+- **Unit tests** (`mcp/src/main.rs`, `mcp/src/simulator.rs`) cover reading
+  serialization, JSON-RPC dispatch (initialize, `tools/list`, notifications,
+  unknown methods), tool-level error handling, and the simulator model itself
+  (readings stay in physical ranges across a drive cycle, the engine warms up,
+  idle vs. cruise is coherent, and each fault scenario skews the right values
+  and sets the right code). No hardware or data files needed.
 - **Integration tests** (`mcp/tests/mcp_server.rs`) spawn the real binary and
-  drive it over stdio in demo mode. They assert that *every* emitted line is
-  valid JSON — the regression guard ensuring the library's stdout debug output
-  never leaks into the protocol stream — and check the demo `connect` +
-  `read_live_data` / `read_trouble_codes` flows.
+  drive it over stdio in demo and simulate modes. They assert that *every*
+  emitted line is valid JSON — the regression guard ensuring the library's
+  stdout debug output never leaks into the protocol stream — and check the
+  `connect` → `read_live_data` / `read_trouble_codes` flows, including that a
+  simulated `vacuum_leak` sets `P0171` and that clearing codes turns the light
+  off.
 
 ## Notes
 

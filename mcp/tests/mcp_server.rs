@@ -118,7 +118,7 @@ fn demo_connect_then_read_live_data() {
 
     let connect = tool_json(by_id(&responses, 2));
     assert_eq!(connect["connected"], json!(true));
-    assert_eq!(connect["demo"], json!(true));
+    assert_eq!(connect["mode"], json!("demo"));
 
     // Live data is a structured snapshot; each reading declares availability.
     let live = tool_json(by_id(&responses, 3));
@@ -166,4 +166,76 @@ fn unknown_method_returns_json_rpc_error() {
     })]);
 
     assert_eq!(by_id(&responses, 1)["error"]["code"], json!(-32601));
+}
+
+#[test]
+fn simulate_connect_reports_healthy_and_reads_coherent_live_data() {
+    let responses = run_session(&[
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": "connect", "arguments": {"simulate": true}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+               "params": {"name": "read_live_data", "arguments": {}}}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+               "params": {"name": "read_trouble_codes", "arguments": {}}}),
+    ]);
+
+    let connect = tool_json(by_id(&responses, 1));
+    assert_eq!(connect["mode"], json!("simulate"));
+    assert_eq!(connect["scenario"], json!("healthy"));
+
+    // Live readings must be present, available, and in plausible ranges.
+    let live = tool_json(by_id(&responses, 2));
+    let rpm = live["engine_rpm"]["value"].as_f64().expect("rpm value");
+    assert!((600.0..=6500.0).contains(&rpm), "rpm out of range: {rpm}");
+    assert_eq!(live["engine_rpm"]["available"], json!(true));
+    let coolant = live["coolant_temp"]["value"].as_f64().expect("coolant value");
+    assert!((10.0..=115.0).contains(&coolant), "coolant out of range: {coolant}");
+
+    // A healthy car: no codes, no check-engine light.
+    let dtc = tool_json(by_id(&responses, 3));
+    assert_eq!(dtc["check_engine_light"], json!(false));
+    assert!(dtc["current"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn simulate_vacuum_leak_sets_code_and_clearing_turns_it_off() {
+    let responses = run_session(&[
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": "connect", "arguments": {"simulate": true, "scenario": "vacuum_leak"}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+               "params": {"name": "read_trouble_codes", "arguments": {}}}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+               "params": {"name": "clear_trouble_codes", "arguments": {}}}),
+        json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+               "params": {"name": "read_trouble_codes", "arguments": {}}}),
+    ]);
+
+    // Fault present: MIL on, P0171 reported.
+    let before = tool_json(by_id(&responses, 2));
+    assert_eq!(before["check_engine_light"], json!(true));
+    let codes = before["current"].as_array().unwrap();
+    assert!(
+        codes.iter().any(|c| c["code"] == json!("P0171")),
+        "expected P0171 in {codes:?}"
+    );
+
+    // After clearing: MIL off, no codes.
+    let after = tool_json(by_id(&responses, 4));
+    assert_eq!(after["check_engine_light"], json!(false));
+    assert!(after["current"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn simulate_rejects_unknown_scenario() {
+    let responses = run_session(&[json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "connect", "arguments": {"simulate": true, "scenario": "banana"}}
+    })]);
+
+    let result = &by_id(&responses, 1)["result"];
+    assert_eq!(result["isError"], json!(true));
+    assert!(result["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Unknown scenario"));
 }

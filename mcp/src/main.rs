@@ -16,9 +16,33 @@ use obdium::scalar::{Scalar, Unit};
 use obdium::{BankNumber, OBD};
 use serde_json::{json, Value};
 
+mod simulator;
+use simulator::{Scenario, Simulator};
+
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "obdium-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Server state: the real OBD adapter plus an optional coherent simulator.
+/// Exactly one is "connected" at a time; simulator mode short-circuits the
+/// hardware path so every read comes from the synthetic drive cycle instead.
+struct Server {
+    obd: OBD,
+    sim: Option<Simulator>,
+}
+
+impl Server {
+    fn new() -> Self {
+        Server {
+            obd: OBD::new(),
+            sim: None,
+        }
+    }
+
+    fn is_connected(&self) -> bool {
+        self.sim.is_some() || self.obd.is_connected()
+    }
+}
 
 /// The library uses `println!` for debug output, which would corrupt the
 /// JSON-RPC stream on stdout. On Unix we redirect the process's stdout (fd 1)
@@ -84,7 +108,7 @@ fn main() {
     ensure_data_dir();
     let mut out = take_protocol_stdout();
     let stdin = std::io::stdin();
-    let mut obd = OBD::new();
+    let mut server = Server::new();
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -108,7 +132,7 @@ fn main() {
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
         let params = request.get("params").cloned().unwrap_or(Value::Null);
 
-        let response = handle(&mut obd, method, params, id.clone());
+        let response = handle(&mut server, method, params, id.clone());
 
         if let (Some(id), Some(response)) = (id, response) {
             let envelope = match response {
@@ -129,7 +153,7 @@ fn main() {
 type RpcResult = Result<Value, (i64, String)>;
 
 /// Dispatch a JSON-RPC method. Returns `None` for notifications (no reply).
-fn handle(obd: &mut OBD, method: &str, params: Value, id: Option<Value>) -> Option<RpcResult> {
+fn handle(server: &mut Server, method: &str, params: Value, id: Option<Value>) -> Option<RpcResult> {
     match method {
         "initialize" => Some(Ok(json!({
             "protocolVersion": PROTOCOL_VERSION,
@@ -139,7 +163,7 @@ fn handle(obd: &mut OBD, method: &str, params: Value, id: Option<Value>) -> Opti
         "notifications/initialized" | "notifications/cancelled" => None,
         "ping" => Some(Ok(json!({}))),
         "tools/list" => Some(Ok(json!({"tools": tool_definitions()}))),
-        "tools/call" => Some(call_tool(obd, params)),
+        "tools/call" => Some(call_tool(server, params)),
         _ => {
             // Only reply to requests (those with an id), not notifications.
             id.map(|_| Err((-32601, format!("method not found: {method}"))))
@@ -157,14 +181,16 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "connect",
-            "description": "Connect to an ELM327 adapter on a serial port. Set demo=true to replay recorded sample data instead of using real hardware. Call this before reading data.",
+            "description": "Connect to a vehicle. With no special flags, connects to a real ELM327 adapter on `port`. Set simulate=true for a coherent synthetic drive cycle (engine warms up, idles, accelerates, cruises) with an optional fault `scenario` — best for troubleshooting practice without a car. Set demo=true to replay raw recorded sample data (incoherent, for protocol testing). Call this before reading data.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "port": {"type": "string", "description": "Serial port name, e.g. /dev/tty.OBDII or COM3. Ignored when demo=true."},
+                    "port": {"type": "string", "description": "Serial port name, e.g. /dev/tty.OBDII or COM3. Ignored when demo/simulate is set."},
                     "baud_rate": {"type": "integer", "description": "Baud rate. Defaults to 38400."},
                     "protocol": {"type": "integer", "description": "OBD-II protocol number 0-9. 0 = auto-detect (default)."},
-                    "demo": {"type": "boolean", "description": "Replay recorded sample data instead of connecting to hardware."}
+                    "demo": {"type": "boolean", "description": "Replay recorded sample data (random per read, not physically coherent)."},
+                    "simulate": {"type": "boolean", "description": "Run the coherent vehicle simulator instead of hardware."},
+                    "scenario": {"type": "string", "description": "Fault scenario for simulate mode: healthy (default), vacuum_leak, misfire, or overheat. A fault skews the relevant live values and sets a matching trouble code with the check-engine light on."}
                 }
             }
         },
@@ -201,22 +227,23 @@ fn tool_definitions() -> Value {
     ])
 }
 
-fn call_tool(obd: &mut OBD, params: Value) -> RpcResult {
+fn call_tool(server: &mut Server, params: Value) -> RpcResult {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
 
     let result: Result<Value, String> = match name {
         "list_serial_ports" => Ok(tool_list_serial_ports()),
-        "connect" => tool_connect(obd, &args),
+        "connect" => tool_connect(server, &args),
         "disconnect" => {
-            obd.disconnect();
+            server.sim = None;
+            server.obd.disconnect();
             Ok(json!({"connected": false}))
         }
-        "status" => Ok(tool_status(obd)),
-        "read_trouble_codes" => tool_read_trouble_codes(obd),
-        "clear_trouble_codes" => tool_clear_trouble_codes(obd),
-        "read_live_data" => tool_read_live_data(obd),
-        "read_vin" => tool_read_vin(obd),
+        "status" => Ok(tool_status(server)),
+        "read_trouble_codes" => tool_read_trouble_codes(server),
+        "clear_trouble_codes" => tool_clear_trouble_codes(server),
+        "read_live_data" => tool_read_live_data(server),
+        "read_vin" => tool_read_vin(server),
         other => Err(format!("unknown tool: {other}")),
     };
 
@@ -238,11 +265,11 @@ fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
-fn require_connection(obd: &OBD) -> Result<(), String> {
-    if obd.is_connected() {
+fn require_connection(server: &Server) -> Result<(), String> {
+    if server.is_connected() {
         Ok(())
     } else {
-        Err("Not connected. Call the `connect` tool first (use demo=true to try sample data).".into())
+        Err("Not connected. Call the `connect` tool first (use simulate=true for a coherent simulated car, or demo=true for raw sample data).".into())
     }
 }
 
@@ -257,8 +284,29 @@ fn tool_list_serial_ports() -> Value {
     })
 }
 
-fn tool_connect(obd: &mut OBD, args: &Value) -> Result<Value, String> {
+fn tool_connect(server: &mut Server, args: &Value) -> Result<Value, String> {
     let demo = args.get("demo").and_then(Value::as_bool).unwrap_or(false);
+    let simulate = args.get("simulate").and_then(Value::as_bool).unwrap_or(false);
+
+    // Coherent simulator: no hardware, no recorded replay — a synthetic drive
+    // cycle. Takes precedence and requires no port.
+    if simulate {
+        let scenario_arg = args.get("scenario").and_then(Value::as_str).unwrap_or("");
+        let scenario = Scenario::parse(scenario_arg).ok_or_else(|| {
+            format!("Unknown scenario `{scenario_arg}`. Valid options: {}.", Scenario::VALID)
+        })?;
+        server.obd.disconnect();
+        server.sim = Some(Simulator::new(scenario));
+        return Ok(json!({
+            "connected": true,
+            "mode": "simulate",
+            "scenario": scenario.label(),
+            "port": "SIMULATOR",
+        }));
+    }
+
+    // Any other mode uses the real OBD stack (demo replays recorded data).
+    server.sim = None;
     let baud = args
         .get("baud_rate")
         .and_then(Value::as_u64)
@@ -270,22 +318,33 @@ fn tool_connect(obd: &mut OBD, args: &Value) -> Result<Value, String> {
     } else {
         match args.get("port").and_then(Value::as_str) {
             Some(p) if !p.is_empty() => p.to_string(),
-            _ => return Err("`port` is required unless demo=true.".into()),
+            _ => return Err("`port` is required unless demo=true or simulate=true.".into()),
         }
     };
 
-    match obd.connect(&port, baud, protocol) {
+    match server.obd.connect(&port, baud, protocol) {
         Ok(()) => Ok(json!({
-            "connected": obd.is_connected(),
-            "demo": demo,
-            "port": obd.serial_port_name(),
-            "baud_rate": obd.serial_port_baud_rate(),
+            "connected": server.obd.is_connected(),
+            "mode": if demo { "demo" } else { "hardware" },
+            "port": server.obd.serial_port_name(),
+            "baud_rate": server.obd.serial_port_baud_rate(),
         })),
         Err(e) => Err(format!("Failed to connect: {e}")),
     }
 }
 
-fn tool_status(obd: &mut OBD) -> Value {
+fn tool_status(server: &mut Server) -> Value {
+    if let Some(sim) = &server.sim {
+        return json!({
+            "connected": true,
+            "mode": "simulate",
+            "scenario": sim.scenario().label(),
+            "port": "SIMULATOR",
+            "protocol_name": "Simulated ISO 15765-4 (CAN)",
+            "elapsed_seconds": sim.elapsed(),
+        });
+    }
+    let obd = &mut server.obd;
     let protocol = if obd.is_connected() {
         obd.get_protocol_name().ok()
     } else {
@@ -293,6 +352,7 @@ fn tool_status(obd: &mut OBD) -> Value {
     };
     json!({
         "connected": obd.is_connected(),
+        "mode": if obd.is_connected() { "hardware/demo" } else { "disconnected" },
         "port": obd.serial_port_name(),
         "baud_rate": obd.serial_port_baud_rate(),
         "protocol_number": obd.get_protocol_number(),
@@ -309,9 +369,21 @@ fn trouble_code_json(code: &TroubleCode) -> Value {
     })
 }
 
-fn tool_read_trouble_codes(obd: &mut OBD) -> Result<Value, String> {
-    require_connection(obd)?;
+fn tool_read_trouble_codes(server: &mut Server) -> Result<Value, String> {
+    require_connection(server)?;
 
+    if let Some(sim) = &server.sim {
+        let current: Vec<Value> = sim.trouble_codes().iter().map(trouble_code_json).collect();
+        return Ok(json!({
+            "check_engine_light": sim.check_engine_light(),
+            "reported_count": current.len(),
+            "current": current,
+            "permanent": [],
+            "freeze_frame": [],
+        }));
+    }
+
+    let obd = &mut server.obd;
     let check_engine = obd.has_check_engine_light();
     let count = obd.get_num_trouble_codes();
     let current: Vec<Value> = obd.get_trouble_codes().iter().map(trouble_code_json).collect();
@@ -335,9 +407,13 @@ fn tool_read_trouble_codes(obd: &mut OBD) -> Result<Value, String> {
     }))
 }
 
-fn tool_clear_trouble_codes(obd: &mut OBD) -> Result<Value, String> {
-    require_connection(obd)?;
-    match obd.clear_trouble_codes() {
+fn tool_clear_trouble_codes(server: &mut Server) -> Result<Value, String> {
+    require_connection(server)?;
+    if let Some(sim) = &mut server.sim {
+        sim.clear_codes();
+        return Ok(json!({"cleared": true}));
+    }
+    match server.obd.clear_trouble_codes() {
         Ok(()) => Ok(json!({"cleared": true})),
         Err(e) => Err(format!("Failed to clear trouble codes: {e}")),
     }
@@ -357,9 +433,45 @@ fn scalar_json(s: &Scalar) -> Value {
     }
 }
 
-fn tool_read_live_data(obd: &mut OBD) -> Result<Value, String> {
-    require_connection(obd)?;
+/// Build a `Scalar` reading for the simulator (values it produces are always
+/// "available", never NoData).
+fn sim_scalar(value: f32, unit: Unit) -> Scalar {
+    Scalar { value, unit }
+}
 
+fn sim_read_live_data(sim: &Simulator) -> Value {
+    let f = sim.frame();
+    // A single-bank (inline) engine: bank 2 sensors report no data, matching
+    // what a typical 4-cylinder returns.
+    json!({
+        "engine_rpm": scalar_json(&sim_scalar(f.rpm.round(), Unit::RPM)),
+        "vehicle_speed": scalar_json(&sim_scalar(f.speed.round(), Unit::KilometersPerHour)),
+        "engine_load": scalar_json(&sim_scalar(f.load, Unit::Percent)),
+        "coolant_temp": scalar_json(&sim_scalar(f.coolant.round(), Unit::Celsius)),
+        "intake_air_temp": scalar_json(&sim_scalar(f.intake_air.round(), Unit::Celsius)),
+        "ambient_air_temp": scalar_json(&sim_scalar(f.ambient.round(), Unit::Celsius)),
+        "intake_manifold_pressure": scalar_json(&sim_scalar(f.map.round(), Unit::KiloPascal)),
+        "maf_air_flow_rate": scalar_json(&sim_scalar(f.maf, Unit::GramsPerSecond)),
+        "throttle_position": scalar_json(&sim_scalar(f.throttle, Unit::Percent)),
+        "timing_advance": scalar_json(&sim_scalar(f.timing, Unit::Degrees)),
+        "short_term_fuel_trim_bank1": scalar_json(&sim_scalar(f.stft1, Unit::Percent)),
+        "long_term_fuel_trim_bank1": scalar_json(&sim_scalar(f.ltft1, Unit::Percent)),
+        "short_term_fuel_trim_bank2": scalar_json(&Scalar::no_data()),
+        "long_term_fuel_trim_bank2": scalar_json(&Scalar::no_data()),
+        "fuel_tank_level": scalar_json(&sim_scalar(f.fuel_level, Unit::Percent)),
+        "control_module_voltage": scalar_json(&sim_scalar(f.voltage, Unit::Volts)),
+        "engine_runtime": scalar_json(&sim_scalar(f.runtime.round(), Unit::Seconds)),
+    })
+}
+
+fn tool_read_live_data(server: &mut Server) -> Result<Value, String> {
+    require_connection(server)?;
+
+    if let Some(sim) = &server.sim {
+        return Ok(sim_read_live_data(sim));
+    }
+
+    let obd = &mut server.obd;
     // Ordered list of (label, reading). Kept explicit so the set is obvious.
     let readings = json!({
         "engine_rpm": scalar_json(&obd.rpm()),
@@ -384,9 +496,13 @@ fn tool_read_live_data(obd: &mut OBD) -> Result<Value, String> {
     Ok(readings)
 }
 
-fn tool_read_vin(obd: &mut OBD) -> Result<Value, String> {
-    require_connection(obd)?;
-    match obd.get_vin() {
+fn tool_read_vin(server: &mut Server) -> Result<Value, String> {
+    require_connection(server)?;
+    if server.sim.is_some() {
+        // A stable, valid-format sample VIN for the simulated vehicle.
+        return Ok(json!({"vin": "1HGCM82633A004352", "note": "simulated vehicle"}));
+    }
+    match server.obd.get_vin() {
         Some(vin) => Ok(json!({"vin": vin.get_vin()})),
         None => Err("Could not read a VIN from the vehicle.".into()),
     }
@@ -441,8 +557,8 @@ mod tests {
 
     #[test]
     fn initialize_returns_handshake() {
-        let mut obd = OBD::new();
-        let res = handle(&mut obd, "initialize", Value::Null, Some(json!(1)))
+        let mut server = Server::new();
+        let res = handle(&mut server, "initialize", Value::Null, Some(json!(1)))
             .expect("initialize must reply")
             .expect("initialize must succeed");
         assert_eq!(res["protocolVersion"], json!(PROTOCOL_VERSION));
@@ -452,15 +568,15 @@ mod tests {
 
     #[test]
     fn initialized_notification_has_no_reply() {
-        let mut obd = OBD::new();
+        let mut server = Server::new();
         // A notification has no id and must not produce a response.
-        assert!(handle(&mut obd, "notifications/initialized", Value::Null, None).is_none());
+        assert!(handle(&mut server, "notifications/initialized", Value::Null, None).is_none());
     }
 
     #[test]
     fn tools_list_advertises_all_tools() {
-        let mut obd = OBD::new();
-        let res = handle(&mut obd, "tools/list", Value::Null, Some(json!(2)))
+        let mut server = Server::new();
+        let res = handle(&mut server, "tools/list", Value::Null, Some(json!(2)))
             .unwrap()
             .unwrap();
         let tools = res["tools"].as_array().expect("tools array");
@@ -486,8 +602,8 @@ mod tests {
 
     #[test]
     fn unknown_method_with_id_is_method_not_found() {
-        let mut obd = OBD::new();
-        let err = handle(&mut obd, "does/not/exist", Value::Null, Some(json!(9)))
+        let mut server = Server::new();
+        let err = handle(&mut server, "does/not/exist", Value::Null, Some(json!(9)))
             .expect("request must reply")
             .expect_err("must be an error");
         assert_eq!(err.0, -32601);
@@ -495,17 +611,17 @@ mod tests {
 
     #[test]
     fn unknown_notification_has_no_reply() {
-        let mut obd = OBD::new();
-        assert!(handle(&mut obd, "does/not/exist", Value::Null, None).is_none());
+        let mut server = Server::new();
+        assert!(handle(&mut server, "does/not/exist", Value::Null, None).is_none());
     }
 
     // --- tool-level behavior ----------------------------------------------
 
     #[test]
     fn reading_before_connect_is_a_tool_error() {
-        let mut obd = OBD::new();
+        let mut server = Server::new();
         let params = json!({"name": "read_live_data", "arguments": {}});
-        let res = call_tool(&mut obd, params).expect("tools/call replies");
+        let res = call_tool(&mut server, params).expect("tools/call replies");
         assert_eq!(res["isError"], json!(true));
         assert!(res["content"][0]["text"]
             .as_str()
@@ -515,9 +631,9 @@ mod tests {
 
     #[test]
     fn calling_unknown_tool_is_a_tool_error() {
-        let mut obd = OBD::new();
+        let mut server = Server::new();
         let params = json!({"name": "frobnicate", "arguments": {}});
-        let res = call_tool(&mut obd, params).unwrap();
+        let res = call_tool(&mut server, params).unwrap();
         assert_eq!(res["isError"], json!(true));
         assert!(res["content"][0]["text"]
             .as_str()
