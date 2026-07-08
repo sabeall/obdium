@@ -216,18 +216,27 @@ impl Simulator {
         self.scenario != Scenario::Healthy
     }
 
-    /// Trouble codes matching the active scenario, with descriptions looked up
-    /// from OBDium's code database (same source the real reads use).
+    /// Trouble codes matching the active scenario. Descriptions are carried
+    /// here directly rather than looked up from the code database, so simulate
+    /// mode reads cleanly even if the (Git LFS) description DB isn't present.
     pub fn trouble_codes(&self) -> Vec<TroubleCode> {
-        let codes: &[&str] = match self.scenario {
+        let codes: &[(&str, &str)] = match self.scenario {
             Scenario::Healthy => &[],
-            Scenario::VacuumLeak => &["P0171"],
-            Scenario::Misfire => &["P0300", "P0301"],
-            Scenario::Overheat => &["P0217"],
+            Scenario::VacuumLeak => &[("P0171", "System Too Lean (Bank 1)")],
+            Scenario::Misfire => &[
+                ("P0300", "Random/Multiple Cylinder Misfire Detected"),
+                ("P0301", "Cylinder 1 Misfire Detected"),
+            ],
+            Scenario::Overheat => &[("P0217", "Engine Over Temperature Condition")],
         };
         codes
             .iter()
-            .map(|dtc| TroubleCode::new(TroubleCodeCategory::Powertrain, dtc.to_string(), false))
+            .map(|(dtc, desc)| TroubleCode {
+                category: TroubleCodeCategory::Powertrain,
+                dtc: dtc.to_string(),
+                description: desc.to_string(),
+                permanant: false,
+            })
             .collect()
     }
 }
@@ -310,6 +319,13 @@ mod tests {
         let codes = sim.trouble_codes();
         assert_eq!(codes.len(), 1);
         assert_eq!(codes[0].dtc, "P0171");
+        // Descriptions are carried by the simulator, so they're populated even
+        // without the (Git LFS) code-description database present.
+        assert!(
+            codes[0].description.to_lowercase().contains("lean"),
+            "expected a description, got {:?}",
+            codes[0].description
+        );
     }
 
     #[test]
