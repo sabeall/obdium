@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "obdium": {
+      "command": "REPLACE_WITH_ABSOLUTE_PATH/obd-mcp/obd-mcp",
+      "args": []
+    }
+  }
+}
