@@ -11,9 +11,9 @@
 
 use std::io::{BufRead, Write};
 
-use obdium::diagnostics::TroubleCode;
+use obdium::diagnostics::{Test, TroubleCode};
 use obdium::scalar::{Scalar, Unit};
-use obdium::{BankNumber, OBD};
+use obdium::{BankNumber, Service, OBD};
 use serde_json::{json, Value};
 
 mod dbc;
@@ -247,7 +247,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "read_trouble_codes",
-            "description": "Read diagnostic trouble codes (DTCs): current/stored, permanent, and freeze-frame, each with a plain-language description. Also reports the check-engine (MIL) light state.",
+            "description": "Read diagnostic trouble codes (DTCs): current/stored, permanent, and freeze-frame, each with a plain-language description. Also reports the check-engine (MIL) light state, distance/time driven with the MIL on, and warm-ups/distance/time since codes were last cleared — useful for judging how long a fault has been present or how recently codes were reset.",
             "inputSchema": empty
         },
         {
@@ -257,7 +257,12 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "read_live_data",
-            "description": "Read a snapshot of live sensor values (RPM, speed, coolant temp, engine load, throttle, fuel trims, MAF, intake, module voltage, etc). Sensors the vehicle does not support are reported as no data.",
+            "description": "Read a snapshot of live sensor values (RPM, speed, coolant temp, engine load, throttle, fuel trims, MAF, intake, module voltage, odometer, engine oil temp, engine torque, relative throttle position, etc). Sensors the vehicle does not support are reported as no data.",
+            "inputSchema": empty
+        },
+        {
+            "name": "read_readiness_monitors",
+            "description": "Read OBD-II readiness/emissions monitor status (misfire, fuel system, components, catalyst, O2 sensor, O2 sensor heater, EGR/VVT, EVAP, secondary air, etc — the exact set depends on spark vs. compression ignition). Each monitor reports whether it's supported on this vehicle and whether it has finished running (\"complete\"/\"ready\") since codes were last cleared. This is what a state emissions/smog inspection checks, and is also useful to see whether a fix actually resolved an issue (a monitor going from incomplete to complete/passed after a repair and a drive cycle is a good sign).",
             "inputSchema": empty
         },
         {
@@ -324,6 +329,7 @@ fn call_tool(server: &mut Server, params: Value) -> RpcResult {
         }
         "status" => Ok(tool_status(server)),
         "read_trouble_codes" => tool_read_trouble_codes(server),
+        "read_readiness_monitors" => tool_read_readiness_monitors(server),
         "clear_trouble_codes" => tool_clear_trouble_codes(server),
         "read_live_data" => tool_read_live_data(server),
         "read_vin" => tool_read_vin(server),
@@ -633,6 +639,12 @@ const LIVE_DATA_LABELS: &[(&str, &str)] = &[
     ("fuel_tank_level", "Fuel level"),
     ("control_module_voltage", "Module voltage"),
     ("engine_runtime", "Engine runtime"),
+    ("odometer", "Odometer"),
+    ("engine_oil_temp", "Engine oil temp"),
+    ("relative_throttle_position", "Relative throttle position"),
+    ("drivers_demand_engine_torque", "Driver's demand engine torque"),
+    ("actual_engine_torque", "Actual engine torque"),
+    ("reference_engine_torque", "Reference engine torque"),
 ];
 
 /// An at-a-glance status for a reading — only for values that can be judged
@@ -734,6 +746,11 @@ fn tool_read_trouble_codes(server: &mut Server) -> Result<Value, String> {
             "current": current,
             "permanent": [],
             "freeze_frame": [],
+            "distance_since_cleared": scalar_json(&Scalar::no_data()),
+            "warmups_since_cleared": scalar_json(&Scalar::no_data()),
+            "time_since_cleared": scalar_json(&Scalar::no_data()),
+            "distance_with_mil": scalar_json(&Scalar::no_data()),
+            "time_with_mil": scalar_json(&Scalar::no_data()),
         }));
     }
 
@@ -751,6 +768,11 @@ fn tool_read_trouble_codes(server: &mut Server) -> Result<Value, String> {
         .iter()
         .map(trouble_code_json)
         .collect();
+    let distance_since_cleared = scalar_json(&obd.distance_traveled_since_codes_cleared());
+    let warmups_since_cleared = scalar_json(&obd.warm_ups_since_codes_cleared());
+    let time_since_cleared = scalar_json(&obd.time_since_codes_cleared());
+    let distance_with_mil = scalar_json(&obd.distance_traveled_with_mil());
+    let time_with_mil = scalar_json(&obd.time_run_with_mil());
 
     Ok(json!({
         "check_engine_light": check_engine,
@@ -758,6 +780,11 @@ fn tool_read_trouble_codes(server: &mut Server) -> Result<Value, String> {
         "current": current,
         "permanent": permanent,
         "freeze_frame": freeze_frame,
+        "distance_since_cleared": distance_since_cleared,
+        "warmups_since_cleared": warmups_since_cleared,
+        "time_since_cleared": time_since_cleared,
+        "distance_with_mil": distance_with_mil,
+        "time_with_mil": time_with_mil,
     }))
 }
 
@@ -771,6 +798,84 @@ fn tool_clear_trouble_codes(server: &mut Server) -> Result<Value, String> {
         Ok(()) => Ok(json!({"cleared": true})),
         Err(e) => Err(format!("Failed to clear trouble codes: {e}")),
     }
+}
+
+fn test_json(t: &Test) -> Value {
+    json!({
+        "name": t.name,
+        "available": t.available,
+        "complete": t.complete,
+    })
+}
+
+/// A monitor name that's incomplete-but-available for the given simulator scenario,
+/// mirroring which DTC/fault the simulator injects for that scenario.
+fn sim_incomplete_monitor(sim: &Simulator) -> Option<&'static str> {
+    match sim.scenario() {
+        Scenario::Healthy => None,
+        Scenario::VacuumLeak => Some("Fuel System"),
+        Scenario::Misfire => Some("Misfire"),
+        Scenario::Overheat => None,
+    }
+}
+
+fn sim_readiness_monitors(sim: &Simulator) -> Value {
+    const COMMON: [&str; 3] = ["Components", "Fuel System", "Misfire"];
+    const ADVANCED: [&str; 8] = [
+        "EGR and/or VVT System",
+        "Oxygen Sensor Heater",
+        "Oxygen Sensor",
+        "Gasoline Particulate Filter",
+        "Secondary Air System",
+        "Evaporative System",
+        "Heated Catalyst",
+        "Catalyst",
+    ];
+    let stuck = sim_incomplete_monitor(sim);
+
+    let to_json = |name: &str| {
+        json!({"name": name, "available": true, "complete": Some(name) != stuck})
+    };
+    let common_tests: Vec<Value> = COMMON.iter().map(|n| to_json(n)).collect();
+    let advanced_tests: Vec<Value> = ADVANCED.iter().map(|n| to_json(n)).collect();
+    let incomplete_monitors: Vec<String> = stuck.into_iter().map(String::from).collect();
+
+    json!({
+        "common_tests": common_tests,
+        "advanced_tests": advanced_tests,
+        "emissions_ready": incomplete_monitors.is_empty(),
+        "incomplete_monitors": incomplete_monitors,
+        "note": "simulated vehicle",
+    })
+}
+
+fn tool_read_readiness_monitors(server: &mut Server) -> Result<Value, String> {
+    require_connection(server)?;
+
+    if let Some(sim) = &server.sim {
+        return Ok(sim_readiness_monitors(sim));
+    }
+
+    let obd = &mut server.obd;
+    let common = obd.get_common_tests_status();
+    let advanced = obd.get_advanced_tests_status();
+
+    let common_tests: Vec<Value> = common.iter().map(test_json).collect();
+    let advanced_tests: Vec<Value> = advanced.iter().map(test_json).collect();
+    let incomplete_monitors: Vec<String> = common
+        .iter()
+        .chain(advanced.iter())
+        .filter(|t| t.available && !t.complete)
+        .map(|t| t.name.to_string())
+        .collect();
+
+    Ok(json!({
+        "common_tests": common_tests,
+        "advanced_tests": advanced_tests,
+        "emissions_ready": incomplete_monitors.is_empty(),
+        "incomplete_monitors": incomplete_monitors,
+        "note": "A monitor must be complete (\"ready\") to pass most state emissions/smog inspections. Monitors reset to incomplete after codes are cleared or the battery is disconnected, and need real-world drive cycles to run again.",
+    }))
 }
 
 /// Serialize a Scalar as a value/unit/display object, or null-ish for no data.
@@ -815,6 +920,13 @@ fn sim_read_live_data(sim: &Simulator) -> Value {
         "fuel_tank_level": scalar_json(&sim_scalar(f.fuel_level, Unit::Percent)),
         "control_module_voltage": scalar_json(&sim_scalar(f.voltage, Unit::Volts)),
         "engine_runtime": scalar_json(&sim_scalar(f.runtime.round(), Unit::Seconds)),
+        // Not modeled by the simulator (no synthetic drive-cycle data for these).
+        "odometer": scalar_json(&Scalar::no_data()),
+        "engine_oil_temp": scalar_json(&Scalar::no_data()),
+        "relative_throttle_position": scalar_json(&Scalar::no_data()),
+        "drivers_demand_engine_torque": scalar_json(&Scalar::no_data()),
+        "actual_engine_torque": scalar_json(&Scalar::no_data()),
+        "reference_engine_torque": scalar_json(&Scalar::no_data()),
     })
 }
 
@@ -845,6 +957,12 @@ fn tool_read_live_data(server: &mut Server) -> Result<Value, String> {
         "fuel_tank_level": scalar_json(&obd.fuel_tank_level()),
         "control_module_voltage": scalar_json(&obd.control_module_voltage()),
         "engine_runtime": scalar_json(&obd.engine_runtime()),
+        "odometer": scalar_json(&obd.odometer()),
+        "engine_oil_temp": scalar_json(&obd.engine_oil_temp(Service::Mode01)),
+        "relative_throttle_position": scalar_json(&obd.relative_throttle_pos()),
+        "drivers_demand_engine_torque": scalar_json(&obd.drivers_demand_engine_torque()),
+        "actual_engine_torque": scalar_json(&obd.actual_engine_torque()),
+        "reference_engine_torque": scalar_json(&obd.reference_engine_torque()),
     });
 
     Ok(readings)
