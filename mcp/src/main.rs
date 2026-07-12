@@ -43,7 +43,12 @@ most to least likely.\n\
 5. Checklist — an ordered, actionable checklist of what the user should do \
 next, written as markdown checkboxes (`- [ ] ...`).\n\
 The `diagnose` tool bundles the trouble codes and live data together with this \
-same section structure, so prefer it as the starting point for a diagnosis.";
+same section structure, so prefer it as the starting point for a diagnosis.\n\
+\n\
+To connect to the user's adapter, just call `connect` with no port — the default \
+transport is \"auto\", which tries serial ports and then BLE and connects to \
+whichever answers. Only pass `transport`/`port` when the user wants a specific \
+adapter. Do not assume the dongle is serial-only.";
 
 /// Server state: the real OBD adapter plus an optional coherent simulator.
 /// Exactly one is "connected" at a time; simulator mode short-circuits the
@@ -216,12 +221,12 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "connect",
-            "description": "Connect to a vehicle. With no special flags, connects to a real ELM327 adapter on `port` over serial. Set transport=\"ble\" to connect to a BLE (GATT) adapter such as the Veepeak OBDCheck BLE — in that case `port` is the BLE device's advertised name or id (see list_ble_devices) and `baud_rate` is ignored. Set simulate=true for a coherent synthetic drive cycle (engine warms up, idles, accelerates, cruises) with an optional fault `scenario` — best for troubleshooting practice without a car. Set demo=true to replay raw recorded sample data (incoherent, for protocol testing). Call this before reading data.",
+            "description": "Connect to a vehicle. By default (transport=\"auto\") it tries serial ports first and then BLE, connecting to the first ELM327 adapter that answers — so you can just call connect with no arguments to reach a plugged-in dongle whether it's serial or BLE (e.g. a Veepeak OBDCheck BLE). Set transport=\"serial\" or \"ble\" with a `port` to target one explicitly (for BLE, `port` is the device's advertised name or id from list_ble_devices; baud_rate is ignored). Set simulate=true for a coherent synthetic drive cycle (engine warms up, idles, accelerates, cruises) with an optional fault `scenario` — best for troubleshooting practice without a car. Set demo=true to replay raw recorded sample data (incoherent, for protocol testing). Call this before reading data.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "port": {"type": "string", "description": "Serial port name (e.g. /dev/tty.OBDII, COM3) or, when transport=ble, the BLE device name/id. Ignored when demo/simulate is set."},
-                    "transport": {"type": "string", "description": "Backend to use: \"serial\" (default) or \"ble\"."},
+                    "port": {"type": "string", "description": "Optional. Serial port name (e.g. /dev/tty.OBDII, COM3) or, for BLE, the device name/id. Omit it with transport=auto to scan and auto-pick. Ignored when demo/simulate is set."},
+                    "transport": {"type": "string", "description": "Backend to use: \"auto\" (default: try serial then BLE), \"serial\", or \"ble\"."},
                     "baud_rate": {"type": "integer", "description": "Baud rate. Defaults to 38400. Ignored for BLE."},
                     "protocol": {"type": "integer", "description": "OBD-II protocol number 0-9. 0 = auto-detect (default)."},
                     "demo": {"type": "boolean", "description": "Replay recorded sample data (random per read, not physically coherent)."},
@@ -393,35 +398,135 @@ fn tool_connect(server: &mut Server, args: &Value) -> Result<Value, String> {
         .and_then(Value::as_u64)
         .unwrap_or(38400) as u32;
     let protocol = args.get("protocol").and_then(Value::as_u64).unwrap_or(0) as u8;
-    let transport = args.get("transport").and_then(Value::as_str).unwrap_or("serial");
+    let transport = args.get("transport").and_then(Value::as_str).unwrap_or("auto");
+    let explicit_port = args
+        .get("port")
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_string());
 
-    // BLE (GATT) adapters aren't serial ports; `port` carries the device name/id.
-    if transport == "ble" && !demo {
-        let identifier = match args.get("port").and_then(Value::as_str) {
-            Some(p) if !p.is_empty() => p,
-            _ => return Err("`port` (BLE device name or id) is required for transport=ble.".into()),
-        };
-        return connect_ble(server, identifier, protocol);
+    // Demo replays recorded data over the serial path regardless of transport.
+    if demo {
+        return connect_serial(server, "DEMO MODE", baud, protocol, true);
     }
 
-    let port = if demo {
-        "DEMO MODE".to_string()
-    } else {
-        match args.get("port").and_then(Value::as_str) {
-            Some(p) if !p.is_empty() => p.to_string(),
-            _ => return Err("`port` is required unless demo=true or simulate=true.".into()),
+    match transport {
+        "serial" => {
+            let port = explicit_port
+                .ok_or("`port` is required for transport=serial (or use demo/simulate).")?;
+            connect_serial(server, &port, baud, protocol, false)
         }
-    };
+        "ble" => {
+            let id = explicit_port
+                .ok_or("`port` (BLE device name or id) is required for transport=ble.")?;
+            connect_ble(server, &id, protocol)
+        }
+        // "auto" (default): try serial, then BLE, so "connect to my dongle" just works.
+        _ => connect_auto(server, explicit_port.as_deref(), baud, protocol),
+    }
+}
 
-    match server.obd.connect(&port, baud, protocol) {
-        Ok(()) => Ok(json!({
-            "connected": server.obd.is_connected(),
+/// Connect over serial (or demo replay). Shared by explicit `transport=serial`,
+/// demo mode, and the serial leg of `auto`.
+fn connect_serial(
+    server: &mut Server,
+    port: &str,
+    baud: u32,
+    protocol: u8,
+    demo: bool,
+) -> Result<Value, String> {
+    match server.obd.connect(port, baud, protocol) {
+        Ok(()) if server.obd.is_connected() => Ok(json!({
+            "connected": true,
             "mode": if demo { "demo" } else { "hardware" },
+            "transport": if demo { "demo" } else { "serial" },
             "port": server.obd.serial_port_name(),
             "baud_rate": server.obd.serial_port_baud_rate(),
         })),
+        Ok(()) => Err(format!("No adapter responded on {port}.")),
         Err(e) => Err(format!("Failed to connect: {e}")),
     }
+}
+
+/// Try every available adapter — serial ports first, then BLE — and connect to the
+/// first that answers. With an explicit `port`, that value is tried as a serial port
+/// and (if serial fails) as a BLE name/id.
+fn connect_auto(
+    server: &mut Server,
+    explicit_port: Option<&str>,
+    baud: u32,
+    protocol: u8,
+) -> Result<Value, String> {
+    let mut tried: Vec<String> = Vec::new();
+
+    // 1) Serial: the given port, else probe for responding ELM327 ports.
+    let serial_candidates: Vec<(String, u32)> = match explicit_port {
+        Some(p) => vec![(p.to_string(), baud)],
+        None => OBD::get_open_serial_ports(),
+    };
+    for (port, cbaud) in serial_candidates {
+        tried.push(format!("serial:{port}"));
+        if server.obd.connect(&port, cbaud, protocol).is_ok() && server.obd.is_connected() {
+            return Ok(json!({
+                "connected": true,
+                "mode": "hardware",
+                "transport": "serial",
+                "port": server.obd.serial_port_name(),
+                "baud_rate": server.obd.serial_port_baud_rate(),
+            }));
+        }
+        server.obd.disconnect();
+    }
+
+    // 2) BLE: the given id, else scan for advertising adapters.
+    if let Some(connected) = connect_auto_ble(server, explicit_port, protocol, &mut tried) {
+        return Ok(connected);
+    }
+
+    Err(format!(
+        "No OBD adapter found over serial or BLE (tried: {}). Make sure the dongle is \
+         powered (plugged into the car with the ignition/accessory on) and in range, and \
+         that this machine has Bluetooth permission.",
+        if tried.is_empty() { "nothing".to_string() } else { tried.join(", ") }
+    ))
+}
+
+/// BLE leg of `connect_auto`. Returns `Some(json)` on success. No-op without the
+/// `ble` feature so `auto` still works as serial-only.
+#[cfg(feature = "ble")]
+fn connect_auto_ble(
+    server: &mut Server,
+    explicit_port: Option<&str>,
+    protocol: u8,
+    tried: &mut Vec<String>,
+) -> Option<Value> {
+    let ble_candidates: Vec<(String, String)> = match explicit_port {
+        Some(p) => vec![(p.to_string(), p.to_string())],
+        None => obdium::transport::scan_ble_adapters(false),
+    };
+    for (name, id) in ble_candidates {
+        tried.push(format!("ble:{name}"));
+        if server.obd.connect_ble(&id, protocol).is_ok() && server.obd.is_connected() {
+            return Some(json!({
+                "connected": true,
+                "mode": "hardware",
+                "transport": "ble",
+                "port": server.obd.serial_port_name(),
+            }));
+        }
+        server.obd.disconnect();
+    }
+    None
+}
+
+#[cfg(not(feature = "ble"))]
+fn connect_auto_ble(
+    _server: &mut Server,
+    _explicit_port: Option<&str>,
+    _protocol: u8,
+    _tried: &mut [String],
+) -> Option<Value> {
+    None
 }
 
 /// List nearby BLE ELM327 adapters. Returns an empty list (with a note) when the

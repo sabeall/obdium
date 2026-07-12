@@ -64,15 +64,31 @@ impl BleTransport {
         let rt = Runtime::new().map_err(|_| Error::ConnectionFailed)?;
         let (tx, rx) = mpsc::channel::<u8>();
 
-        let (peripheral, write_char, notify_char, name) =
-            rt.block_on(connect_inner(identifier))?;
+        const STEP_TIMEOUT: Duration = Duration::from_secs(15);
+
+        let (peripheral, write_char, notify_char, name) = rt.block_on(async {
+            match tokio::time::timeout(STEP_TIMEOUT, connect_inner(identifier)).await {
+                Ok(res) => res,
+                Err(_) => {
+                    println!("BLE connect_inner timed out after {STEP_TIMEOUT:?}");
+                    Err(Error::ConnectionFailed)
+                }
+            }
+        })?;
 
         // Subscribe and pump notifications into the channel for the connection lifetime.
         rt.block_on(async {
-            peripheral
-                .subscribe(&notify_char)
-                .await
-                .map_err(|_| Error::ConnectionFailed)
+            match tokio::time::timeout(STEP_TIMEOUT, peripheral.subscribe(&notify_char)).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => {
+                    println!("BLE subscribe failed: {e:?}");
+                    Err(Error::ConnectionFailed)
+                }
+                Err(_) => {
+                    println!("BLE subscribe timed out after {STEP_TIMEOUT:?}");
+                    Err(Error::ConnectionFailed)
+                }
+            }
         })?;
         spawn_notification_pump(&rt, peripheral.clone(), notify_char.uuid, tx);
 
@@ -211,6 +227,7 @@ pub fn scan_ble_adapters(all: bool) -> Vec<(String, String)> {
 async fn connect_inner(
     identifier: &str,
 ) -> Result<(Peripheral, Characteristic, Characteristic, String), Error> {
+    println!("BLE: creating manager");
     let manager = Manager::new().await.map_err(|_| Error::ConnectionFailed)?;
     let central = manager
         .adapters()
@@ -220,16 +237,20 @@ async fn connect_inner(
         .next()
         .ok_or(Error::ConnectionFailed)?;
 
+    println!("BLE: starting scan");
     central
         .start_scan(ScanFilter::default())
         .await
         .map_err(|_| Error::ConnectionFailed)?;
     tokio::time::sleep(SCAN_TIME).await;
+    println!("BLE: scan sleep done, stopping scan");
+    let _ = central.stop_scan().await;
 
     let peripherals = central
         .peripherals()
         .await
         .map_err(|_| Error::ConnectionFailed)?;
+    println!("BLE: found {} peripherals", peripherals.len());
 
     let needle = identifier.to_lowercase();
     let mut chosen: Option<(Peripheral, String)> = None;
@@ -247,19 +268,30 @@ async fn connect_inner(
         }
     }
     let (peripheral, name) = chosen.ok_or(Error::ConnectionFailed)?;
+    println!("BLE: chose peripheral {name}, connecting");
 
     peripheral
         .connect()
         .await
-        .map_err(|_| Error::ConnectionFailed)?;
+        .map_err(|e| {
+            println!("BLE: peripheral.connect() failed: {e:?}");
+            Error::ConnectionFailed
+        })?;
+    println!("BLE: connected, discovering services");
     peripheral
         .discover_services()
         .await
-        .map_err(|_| Error::ConnectionFailed)?;
+        .map_err(|e| {
+            println!("BLE: discover_services() failed: {e:?}");
+            Error::ConnectionFailed
+        })?;
+    println!("BLE: services discovered");
 
     let chars = peripheral.characteristics();
+    println!("BLE: {} characteristics found: {:?}", chars.len(), chars.iter().map(|c| (c.uuid, c.properties)).collect::<Vec<_>>());
     let write_char = pick_characteristic(&chars, true).ok_or(Error::ConnectionFailed)?;
     let notify_char = pick_characteristic(&chars, false).ok_or(Error::ConnectionFailed)?;
+    println!("BLE: write_char={:?} notify_char={:?}", write_char.uuid, notify_char.uuid);
 
     Ok((peripheral, write_char, notify_char, name))
 }
@@ -275,23 +307,29 @@ fn pick_characteristic(
     } else {
         &[known_uuids::NOTIFY_FFF1, known_uuids::CHAR_FFE1]
     };
+    let has_required_prop = |c: &Characteristic| {
+        if want_write {
+            c.properties
+                .intersects(CharPropFlags::WRITE | CharPropFlags::WRITE_WITHOUT_RESPONSE)
+        } else {
+            c.properties
+                .intersects(CharPropFlags::NOTIFY | CharPropFlags::INDICATE)
+        }
+    };
 
-    if let Some(c) = chars.iter().find(|c| preferred.contains(&c.uuid)) {
-        return Some(c.clone());
+    // A UUID match only counts if that characteristic actually has the
+    // needed property — the same UUID can appear multiple times across
+    // services/instances with different capabilities.
+    for &uuid in preferred {
+        if let Some(c) = chars
+            .iter()
+            .find(|c| c.uuid == uuid && has_required_prop(c))
+        {
+            return Some(c.clone());
+        }
     }
 
-    chars
-        .iter()
-        .find(|c| {
-            if want_write {
-                c.properties
-                    .intersects(CharPropFlags::WRITE | CharPropFlags::WRITE_WITHOUT_RESPONSE)
-            } else {
-                c.properties
-                    .intersects(CharPropFlags::NOTIFY | CharPropFlags::INDICATE)
-            }
-        })
-        .cloned()
+    chars.iter().find(|c| has_required_prop(c)).cloned()
 }
 
 /// Spawn the long-lived task that forwards notification bytes into the channel.
