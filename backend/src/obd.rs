@@ -167,6 +167,13 @@ impl OBD {
         self.send_command(&mut command)?;
         self.protocol = protocol;
 
+        // Read and discard the ATSPx response. Otherwise it lingers unread in
+        // the transport pipe and can be misread as the response to whatever
+        // command runs next — especially over BLE, where notification
+        // delivery is asynchronous and a same-instant `clear()` can't flush
+        // bytes that haven't arrived yet.
+        let _ = self.read_until(b'>');
+
         initialized
     }
 
