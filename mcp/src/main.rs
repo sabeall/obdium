@@ -36,7 +36,11 @@ these sections, in this exact order:\n\
 1. Diagnostics — interpret the live sensor data and trouble codes: what is \
 normal, what is abnormal, and what it points to.\n\
 2. Common Problems — the likely causes for this vehicle and code, ranked from \
-most to least likely.\n\
+most to least likely. If any trouble code is active (current, permanent, or \
+freeze-frame), use web search to check what other owners of this make/model/\
+engine have reported for that exact code — forums (e.g. model-specific \
+enthusiast forums, Reddit), not just NHTSA — and fold in anything relevant, \
+citing the source. Do this for every active code, not just the first.\n\
 3. NHTSA — real recalls and owner complaints for the vehicle. Call the \
 `known_issues` tool to get this; if it is unavailable, say so.\n\
 4. Summary — a short, plain-language conclusion the user can act on.\n\
@@ -611,7 +615,7 @@ fn presentation_guide() -> Value {
         "format": "Organize the answer to the user in these sections, in this order. Use markdown headings.",
         "sections": [
             {"heading": "Diagnostics", "content": "Render the provided `chart` (Parameter | Value | Status) as a markdown table so it is easy to read, then interpret it and the trouble codes: what is normal, what is abnormal (see the Status column), and what it points to. Also show the trouble codes as a small table (Code | Description)."},
-            {"heading": "Common Problems", "content": "The likely causes for this vehicle and code, ranked from most to least likely."},
+            {"heading": "Common Problems", "content": "The likely causes for this vehicle and code, ranked from most to least likely. If any trouble code is active (current, permanent, or freeze-frame), web-search what other owners of this make/model/engine have reported for that exact code on forums (not just NHTSA) and fold in anything relevant, citing the source."},
             {"heading": "NHTSA", "content": "Real recalls and owner complaints for the vehicle. Call the `known_issues` tool to populate this; if unavailable, say so."},
             {"heading": "Summary", "content": "A short, plain-language conclusion the user can act on."},
             {"heading": "Checklist", "content": "An ordered, actionable checklist of what the user should do next, written as markdown checkboxes (`- [ ] ...`)."}
