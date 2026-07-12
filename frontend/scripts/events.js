@@ -138,11 +138,14 @@ listen("connection-status", async (event) => {
     const serialPort = event.payload.serialPort;
     const baudRate = event.payload.baudRate;
     const protocol = event.payload.protocol;
+    const isBle =
+      document.getElementById("transport-selected").dataset.value === "ble";
 
     connectionLabel.textContent =
       "ELM327 CONNECTED VIA " + serialPort.toUpperCase();
-    status.textContent =
-      "CONNECTED THROUGH SERIAL PORT " + serialPort.toUpperCase();
+    status.textContent = isBle
+      ? "CONNECTED OVER BLE TO " + serialPort.toUpperCase()
+      : "CONNECTED THROUGH SERIAL PORT " + serialPort.toUpperCase();
     connectionIcon.src = "/assets/icons/connected.png";
     window.connected = true;
 
@@ -168,6 +171,7 @@ listen("connection-status", async (event) => {
       serialPort: serialPort,
       baudRate: baudRate,
       protocol: parseInt(protocol),
+      transport: isBle ? "ble" : "serial",
     };
 
     addNotification("CONNECTED VIA ELM", event.payload.message);
@@ -368,6 +372,69 @@ listen("update-serial-ports", (event) => {
   const refreshIcon = refreshButton.querySelector("svg");
 
   refreshIcon.classList.remove("spinning");
+});
+
+// Transport (Serial vs Bluetooth LE) selection.
+//
+// The port dropdown is shared: switching transport re-labels it and repopulates it
+// from the matching scan (serial ports or BLE devices). BLE has no baud rate.
+const transportMenu = document.getElementById("transport-menu");
+const portDropdownLabel = document.getElementById("port-dropdown-label");
+
+function stopRefreshSpin() {
+  const icon = document.getElementById("refresh-serial-ports").querySelector("svg");
+  icon.classList.remove("spinning");
+}
+
+function setTransport(transport) {
+  if (transport === "ble") {
+    portDropdownLabel.textContent = "BLE DEVICE";
+    baudRateSelected.textContent = "N/A";
+    serialPortMenu.innerHTML = "";
+    serialPortSelected.textContent = "SCANNING…";
+    serialPortSelected.dataset.value = "";
+    emit("get-ble-devices");
+  } else {
+    portDropdownLabel.textContent = "SERIAL PORT COM";
+    baudRateSelected.textContent = "0";
+    serialPortSelected.textContent = "DEMO MODE";
+    serialPortSelected.dataset.value = "DEMO MODE";
+    emit("get-serial-ports");
+  }
+}
+
+transportMenu.addEventListener("click", (event) => {
+  if (event.target.tagName === "LI") {
+    setTransport(event.target.dataset.value);
+  }
+});
+
+listen("update-ble-devices", (event) => {
+  serialPortMenu.innerHTML = "";
+
+  const devices = event.payload || [];
+  if (devices.length === 0) {
+    const none = document.createElement("li");
+    none.textContent = "NO BLE DEVICES FOUND";
+    none.dataset.value = "";
+    serialPortMenu.appendChild(none);
+    serialPortSelected.textContent = "NO BLE DEVICES FOUND";
+    serialPortSelected.dataset.value = "";
+  } else {
+    for (const [name, id] of devices) {
+      const option = document.createElement("li");
+      // Show the friendly name; keep the id in data-value for the connect call.
+      option.textContent = name;
+      option.dataset.value = id;
+      serialPortMenu.appendChild(option);
+    }
+
+    // Preselect the first discovered device.
+    serialPortSelected.textContent = devices[0][0];
+    serialPortSelected.dataset.value = devices[0][1];
+  }
+
+  stopRefreshSpin();
 });
 
 const readinessTests = document.getElementById("readiness-tests-list");

@@ -10,6 +10,7 @@ const defaultUserSettings = {
         protocol: 0,
         baudRate: "0",
         serialPort: "0",
+        transport: "serial",
       },
       showPartialVin: false,
       deleteLogsOnExit: false,
@@ -39,6 +40,7 @@ function importSettings() {
       settings.connectionConfig.baudRate,
       settings.connectionConfig.serialPort,
       0,
+      settings.connectionConfig.transport || "serial",
     );
   }
 

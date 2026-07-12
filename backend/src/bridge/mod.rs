@@ -131,6 +131,11 @@ struct ConnectPaylod {
     serial_port: String,
     baud_rate: u32,
     protocol: u8,
+
+    /// Which backend to use: `"serial"` (default) or `"ble"`. For BLE, `serial_port`
+    /// carries the adapter's advertised name or id, and `baud_rate` is ignored.
+    #[serde(default)]
+    transport: String,
 }
 
 #[derive(Deserialize, Serialize)]

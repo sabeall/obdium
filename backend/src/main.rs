@@ -5,7 +5,8 @@ mod bridge;
 mod stats;
 
 use bridge::events::{
-    do_send_connection_status, listen_connect_elm, listen_decode_vin, listen_send_ports,
+    do_send_connection_status, listen_connect_elm, listen_decode_vin, listen_send_ble_devices,
+    listen_send_ports,
 };
 use obdium::{
     vin::{vpic_db_path, APP_DATA_DIR},
@@ -100,21 +101,47 @@ fn track_data(window: &Arc<WebviewWindow>, obd: &Arc<Mutex<OBD>>) {
     custom_pid_calls(window, obd);
 }
 
-fn connect_obd(window: &WebviewWindow, port: String, baud_rate: u32, protocol: u8) -> Option<OBD> {
+/// Connect over BLE. Compiled only with the `ble` feature; otherwise the stub below
+/// reports a friendly message so the default build still links.
+#[cfg(feature = "ble")]
+fn connect_ble_backend(obd: &mut OBD, identifier: &str, protocol: u8) -> Result<(), String> {
+    obd.connect_ble(identifier, protocol).map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "ble"))]
+fn connect_ble_backend(_obd: &mut OBD, _identifier: &str, _protocol: u8) -> Result<(), String> {
+    Err("BLE support is not enabled in this build. Rebuild with `--features ble`.".to_string())
+}
+
+fn connect_obd(
+    window: &WebviewWindow,
+    transport: String,
+    port: String,
+    baud_rate: u32,
+    protocol: u8,
+) -> Option<OBD> {
     // Try to connect obd
     let mut obd = OBD::new();
 
-    match obd.connect(&port, baud_rate, protocol) {
-        Ok(()) => {
-            let band = obd.serial_port_baud_rate().unwrap_or_default();
-            let port = obd.serial_port_name().unwrap_or_default();
+    let is_ble = transport == "ble";
+    let result = if is_ble {
+        connect_ble_backend(&mut obd, &port, protocol)
+    } else {
+        obd.connect(&port, baud_rate, protocol)
+            .map_err(|e| e.to_string())
+    };
 
-            do_send_connection_status(
-                window,
-                &obd,
-                format!("Connected to port {port} on {band} baud"),
-                true,
-            );
+    match result {
+        Ok(()) => {
+            let name = obd.serial_port_name().unwrap_or_default();
+            let message = if is_ble {
+                format!("Connected to {name} over BLE")
+            } else {
+                let band = obd.serial_port_baud_rate().unwrap_or_default();
+                format!("Connected to port {name} on {band} baud")
+            };
+
+            do_send_connection_status(window, &obd, message, true);
 
             Some(obd)
         }
@@ -165,6 +192,7 @@ fn main() {
 
                 listen_decode_vin(&window_arc);
                 listen_send_ports(&window_arc);
+                listen_send_ble_devices(&window_arc);
                 listen_track_custom_pid(&window_arc);
                 listen_connect_elm(&window_arc);
 

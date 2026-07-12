@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Required for CoreBluetooth access. Without a usage description macOS
+	     silently denies BLE scanning/connection. Shown to the user the first
+	     time OBDium accesses Bluetooth. -->
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>OBDium uses Bluetooth to connect to your wireless OBD-II adapter (e.g. Veepeak OBDCheck BLE) and read data from your vehicle.</string>
+	<!-- Legacy key for macOS 10.14 and earlier; harmless on newer versions. -->
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>OBDium uses Bluetooth to connect to your wireless OBD-II adapter (e.g. Veepeak OBDCheck BLE) and read data from your vehicle.</string>
+</dict>
+</plist>

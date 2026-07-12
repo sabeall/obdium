@@ -210,13 +210,19 @@ fn tool_definitions() -> Value {
             "inputSchema": empty
         },
         {
+            "name": "list_ble_devices",
+            "description": "Scan for nearby BLE (GATT) ELM327 adapters such as the Veepeak OBDCheck BLE, which do not appear as serial ports. Returns each device's name and id; pass either to `connect` with transport=\"ble\". Requires the server to be built with the `ble` feature.",
+            "inputSchema": empty
+        },
+        {
             "name": "connect",
-            "description": "Connect to a vehicle. With no special flags, connects to a real ELM327 adapter on `port`. Set simulate=true for a coherent synthetic drive cycle (engine warms up, idles, accelerates, cruises) with an optional fault `scenario` — best for troubleshooting practice without a car. Set demo=true to replay raw recorded sample data (incoherent, for protocol testing). Call this before reading data.",
+            "description": "Connect to a vehicle. With no special flags, connects to a real ELM327 adapter on `port` over serial. Set transport=\"ble\" to connect to a BLE (GATT) adapter such as the Veepeak OBDCheck BLE — in that case `port` is the BLE device's advertised name or id (see list_ble_devices) and `baud_rate` is ignored. Set simulate=true for a coherent synthetic drive cycle (engine warms up, idles, accelerates, cruises) with an optional fault `scenario` — best for troubleshooting practice without a car. Set demo=true to replay raw recorded sample data (incoherent, for protocol testing). Call this before reading data.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "port": {"type": "string", "description": "Serial port name, e.g. /dev/tty.OBDII or COM3. Ignored when demo/simulate is set."},
-                    "baud_rate": {"type": "integer", "description": "Baud rate. Defaults to 38400."},
+                    "port": {"type": "string", "description": "Serial port name (e.g. /dev/tty.OBDII, COM3) or, when transport=ble, the BLE device name/id. Ignored when demo/simulate is set."},
+                    "transport": {"type": "string", "description": "Backend to use: \"serial\" (default) or \"ble\"."},
+                    "baud_rate": {"type": "integer", "description": "Baud rate. Defaults to 38400. Ignored for BLE."},
                     "protocol": {"type": "integer", "description": "OBD-II protocol number 0-9. 0 = auto-detect (default)."},
                     "demo": {"type": "boolean", "description": "Replay recorded sample data (random per read, not physically coherent)."},
                     "simulate": {"type": "boolean", "description": "Run the coherent vehicle simulator instead of hardware."},
@@ -304,6 +310,7 @@ fn call_tool(server: &mut Server, params: Value) -> RpcResult {
     let result: Result<Value, String> = match name {
         "diagnose" => tool_diagnose(server),
         "list_serial_ports" => Ok(tool_list_serial_ports()),
+        "list_ble_devices" => Ok(tool_list_ble_devices()),
         "connect" => tool_connect(server, &args),
         "disconnect" => {
             server.sim = None;
@@ -386,6 +393,16 @@ fn tool_connect(server: &mut Server, args: &Value) -> Result<Value, String> {
         .and_then(Value::as_u64)
         .unwrap_or(38400) as u32;
     let protocol = args.get("protocol").and_then(Value::as_u64).unwrap_or(0) as u8;
+    let transport = args.get("transport").and_then(Value::as_str).unwrap_or("serial");
+
+    // BLE (GATT) adapters aren't serial ports; `port` carries the device name/id.
+    if transport == "ble" && !demo {
+        let identifier = match args.get("port").and_then(Value::as_str) {
+            Some(p) if !p.is_empty() => p,
+            _ => return Err("`port` (BLE device name or id) is required for transport=ble.".into()),
+        };
+        return connect_ble(server, identifier, protocol);
+    }
 
     let port = if demo {
         "DEMO MODE".to_string()
@@ -405,6 +422,48 @@ fn tool_connect(server: &mut Server, args: &Value) -> Result<Value, String> {
         })),
         Err(e) => Err(format!("Failed to connect: {e}")),
     }
+}
+
+/// List nearby BLE ELM327 adapters. Returns an empty list (with a note) when the
+/// server is built without the `ble` feature.
+#[cfg(feature = "ble")]
+fn tool_list_ble_devices() -> Value {
+    let devices: Vec<Value> = obdium::transport::scan_ble_adapters(false)
+        .into_iter()
+        .map(|(name, id)| json!({"name": name, "id": id}))
+        .collect();
+    json!({
+        "devices": devices,
+        "note": "Pass a device `name` or `id` to connect with transport=\"ble\"."
+    })
+}
+
+#[cfg(not(feature = "ble"))]
+fn tool_list_ble_devices() -> Value {
+    json!({
+        "devices": [],
+        "note": "BLE support is not compiled into this build of obd-mcp. Rebuild with `--features ble`."
+    })
+}
+
+/// Connect to a BLE adapter by advertised name/id. Feature-gated so the default
+/// build links without btleplug.
+#[cfg(feature = "ble")]
+fn connect_ble(server: &mut Server, identifier: &str, protocol: u8) -> Result<Value, String> {
+    match server.obd.connect_ble(identifier, protocol) {
+        Ok(()) => Ok(json!({
+            "connected": server.obd.is_connected(),
+            "mode": "hardware",
+            "transport": "ble",
+            "port": server.obd.serial_port_name(),
+        })),
+        Err(e) => Err(format!("Failed to connect over BLE: {e}")),
+    }
+}
+
+#[cfg(not(feature = "ble"))]
+fn connect_ble(_server: &mut Server, _identifier: &str, _protocol: u8) -> Result<Value, String> {
+    Err("BLE support is not compiled into this build of obd-mcp. Rebuild with `--features ble`.".into())
 }
 
 fn tool_status(server: &mut Server) -> Value {
@@ -936,6 +995,7 @@ mod tests {
         for expected in [
             "diagnose",
             "list_serial_ports",
+            "list_ble_devices",
             "connect",
             "disconnect",
             "status",

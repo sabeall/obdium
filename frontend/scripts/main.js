@@ -24,6 +24,7 @@ window.connectionConfig = {
   serialPort: "0",
   baudRate: "0",
   protocol: 0,
+  transport: "serial",
 };
 
 // Personal settings
@@ -118,11 +119,20 @@ connectButton.addEventListener("click", async () => {
   const baudRate = document.getElementById("baud-rate-selected");
   const serialPort = document.getElementById("serial-port-selected");
   const protocol = document.getElementById("protocol-selected");
+  const transport = document.getElementById("transport-selected").dataset.value;
+
+  // For BLE the device is matched by name/id; the selected option's data-value
+  // holds the id (falling back to the visible name).
+  const identifier =
+    transport === "ble"
+      ? serialPort.dataset.value || serialPort.textContent.trim()
+      : serialPort.textContent.trim();
 
   connectElm(
-    baudRate.textContent.trim(),
-    serialPort.textContent.trim(),
+    transport === "ble" ? 0 : baudRate.textContent.trim(),
+    identifier,
     parseInt(protocol.dataset.value),
+    transport,
   );
 });
 

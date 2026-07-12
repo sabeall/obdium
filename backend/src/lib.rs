@@ -6,6 +6,7 @@ mod pid;
 mod replay;
 mod response;
 pub mod scalar;
+pub mod transport;
 pub mod vin;
 
 use std::sync::atomic::AtomicUsize;
