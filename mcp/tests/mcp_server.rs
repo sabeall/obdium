@@ -233,7 +233,7 @@ fn initialize_advertises_the_answer_structure() {
     let instructions = by_id(&responses, 1)["result"]["instructions"]
         .as_str()
         .expect("instructions string");
-    for section in ["Diagnostics", "Common Problems", "NHTSA", "Summary", "Checklist"] {
+    for section in ["Diagnostics", "Common Problems", "Forums", "NHTSA", "Summary", "Checklist"] {
         assert!(instructions.contains(section), "missing {section}");
     }
 }
@@ -258,7 +258,7 @@ fn diagnose_bundles_codes_live_data_and_structure() {
         .collect();
     assert_eq!(
         headings,
-        ["Diagnostics", "Common Problems", "NHTSA", "Summary", "Checklist"]
+        ["Diagnostics", "Common Problems", "Forums", "NHTSA", "Summary", "Checklist"]
     );
 }
 
