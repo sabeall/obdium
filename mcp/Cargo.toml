@@ -1,0 +1,23 @@
+[package]
+name = "obd-mcp"
+version = "1.5.0"
+edition = "2021"
+
+[[bin]]
+name = "obd-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# The pure OBD-II library. Its lib target does not use Tauri, so building this
+# crate does not pull in the desktop app or its build script. `default-features = false`
+# keeps the MCP server lean (no btleplug) unless its own `ble` feature is enabled.
+obdium = { path = "../backend", default-features = false }
+serde_json = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+# Enable the BLE (GATT) transport for the `connect` / `list_ble_devices` tools.
+# Off by default so the server builds without pulling in btleplug/CoreBluetooth.
+ble = ["obdium/ble"]

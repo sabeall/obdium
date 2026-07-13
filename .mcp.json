@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "obdium": {
+      "command": "target/release/obd-mcp",
+      "args": []
+    }
+  }
+}

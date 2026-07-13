@@ -1,0 +1,259 @@
+# OBDium MCP Server
+
+`obd-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server
+that exposes OBDium's ELM327 diagnostics to an MCP client such as **Claude
+Code**. It lets an LLM read your vehicle's live sensor data, trouble codes and
+VIN over your OBD-II adapter so you can troubleshoot your car conversationally.
+
+It reuses the `obdium` library directly — the same OBD-II protocol handling, PID
+decoding, DTC descriptions and VIN reading used by the desktop app.
+
+## Building
+
+The server lives in its own workspace crate (`mcp/`) that depends only on the
+`obdium` library, so building or testing it never compiles the Tauri desktop
+app.
+
+```bash
+cargo build --release -p obd-mcp
+```
+
+This produces `target/release/obd-mcp` at the workspace root.
+
+The binary locates OBDium's `data/` directory automatically (it looks in the
+current directory, then walks up from the executable, checking both there and a
+sibling `backend/` folder), so it can be launched from anywhere.
+
+## Connecting your Bluetooth OBD-II adapter
+
+A Bluetooth ELM327 adapter is not accessed directly. Once you **pair it at the
+operating-system level**, the OS exposes it as a *serial port*, which is what
+this server (and OBDium) talk to:
+
+- **macOS:** appears as `/dev/tty.*` / `/dev/cu.*`. Note that classic-Bluetooth
+  serial (SPP) is required — many cheap BLE-only ELM327 clones do **not** create
+  a serial port on modern macOS and will not be usable this way.
+- **Linux:** bind it with `rfcomm` → `/dev/rfcomm0`.
+- **Windows:** it shows up as an outgoing `COM` port.
+
+Use the `list_serial_ports` tool to see what's available. With the engine's
+ignition on, call `connect` with the port name.
+
+## Using it with Claude Code
+
+A project-scoped config is already checked in at `.mcp.json`. When you open this
+project in Claude Code you'll be prompted to approve the `obdium` server; once
+approved the tools become available.
+
+To register it globally instead:
+
+```bash
+claude mcp add obdium -- /absolute/path/to/target/release/obd-mcp
+```
+
+## Tools
+
+| Tool | Description |
+| --- | --- |
+| `diagnose` | One-shot snapshot: reads trouble codes + live data together and returns them alongside the required answer structure (Diagnostics → Common Problems → NHTSA → Summary → Checklist). Start here for "what's wrong?". |
+| `list_serial_ports` | List serial ports with an ELM327 adapter (incl. paired Bluetooth). |
+| `connect` | Connect to a vehicle. `simulate=true` runs the coherent simulator (optional `scenario`); `demo=true` replays bundled sample data; otherwise connects to real hardware on `port`. Args: `port`, `baud_rate` (default 38400), `protocol` (0–9, 0=auto), `demo`, `simulate`, `scenario`. |
+| `disconnect` | Disconnect from the adapter. |
+| `status` | Connection status, port, baud rate and active OBD-II protocol. |
+| `read_trouble_codes` | Stored, permanent and freeze-frame DTCs with plain-language descriptions, plus check-engine (MIL) state. |
+| `clear_trouble_codes` | Clear stored codes / turn off the check-engine light (service 04). **Destructive** — only on explicit request. |
+| `read_live_data` | Snapshot of live sensors (RPM, speed, coolant, load, throttle, fuel trims, MAF, intake, module voltage, …). Unsupported sensors report "no data". |
+| `read_vin` | Read the vehicle's VIN from the ECU. |
+| `known_issues` | Look up real recalls and owner complaints for a vehicle from **NHTSA** (US public data). Identify by `vin`, by `make`+`model`+`year`, or from the connected vehicle. A decoded VIN also returns richer vPIC attributes (engine, cylinders, displacement, fuel, drive, body). Optional `component` filter. Requires network; results cached. |
+| `dbc_signals` | List the manufacturer-specific CAN messages/signals in a DBC file (e.g. from [opendbc](https://github.com/commaai/opendbc)). Provide `dbc` (inline) or `dbc_path`; optional `filter`. |
+| `decode_can` | Decode a raw CAN frame (`can_id` + `data` hex) into physical signal values using a DBC file. Decodes a frame you supply; does not sniff the bus. |
+
+## Structured diagnostics
+
+So diagnostic answers come out consistently organized, the server does two
+things:
+
+- At `initialize` it returns an **`instructions`** string telling the client to
+  structure every diagnostic answer into these sections, in order:
+  **Diagnostics → Common Problems → NHTSA → Summary → Checklist** (the last as
+  actionable markdown checkboxes).
+- The **`diagnose`** tool bundles the trouble codes and live data in one call
+  and returns them next to that same section structure (`presentation.sections`),
+  so the model has a ready-made skeleton even if the client doesn't surface
+  `instructions`. It's the recommended starting point for "what's wrong?".
+- `diagnose` also returns a ready-to-render **`chart`** (columns
+  `Parameter | Value | Status`) so the readings display as a compact table
+  instead of raw JSON. The `Status` column carries at-a-glance flags only for
+  values that can be judged universally — fuel trims (lean/rich), charging
+  voltage, and coolant over-temp — and is left blank elsewhere so nothing is
+  over-claimed.
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"connect","arguments":{"simulate":true,"scenario":"overheat"}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"diagnose","arguments":{}}}' \
+  | target/release/obd-mcp
+```
+
+## Known issues (NHTSA recalls & complaints)
+
+The `known_issues` tool pairs a live diagnosis with real-world data: it pulls
+**recalls** and **owner complaints** for a specific vehicle from
+[NHTSA](https://www.nhtsa.gov) (US DOT public data, public domain, no API key).
+So when a live trouble code points at, say, the fuel system, you can ask *"what
+do owners of this exact model actually report?"*
+
+Identify the vehicle any of three ways:
+
+- `vin` — decoded via NHTSA vPIC, then looked up. Decoding also returns richer
+  attributes (engine model, cylinder count, displacement, fuel type, drive,
+  body class), so a diagnosis can reason about the actual engine (e.g. a 4.0L
+  V6 with two sensor banks). Cylinder count alone can't tell inline from V, so a
+  `bank_hint` is provided rather than an over-confident claim.
+- `make` + `model` + `year` — skips VIN decoding entirely.
+- nothing — uses the currently connected vehicle's VIN.
+
+An optional `component` argument case-insensitively filters complaints/recalls
+(e.g. `"engine"`, `"fuel system"`). The result summarizes recall campaigns and
+groups complaints by the most-reported component.
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"known_issues","arguments":{"make":"Toyota","model":"4Runner","year":2013,"component":"engine"}}}' \
+  | target/release/obd-mcp
+```
+
+**Notes and limitations:**
+
+- **Requires network access.** Responses are cached per URL for the life of the
+  process, so a repeated lookup works without re-hitting the network — but a
+  cold lookup with no connectivity will error.
+- **Transport:** this prototype shells out to `curl`. Productionizing would swap
+  in a Rust HTTP client (ureq/reqwest); the transport is behind a trait so tests
+  mock it and stay offline.
+- **VIN decoding is remote.** It uses the NHTSA vPIC *API* rather than the
+  bundled `vpic.sqlite.xz`, because the library decompresses that to a ~1.45 GB
+  local database at runtime, which the MCP crate doesn't ship. A fully offline
+  local decode could be wired in later behind the same interface.
+- **Full TSB (technical service bulletin) text is not open data** and is not
+  included; NHTSA exposes recalls and complaints, not the proprietary repair
+  procedures sold by ALLDATA/Mitchell1.
+
+## Manufacturer CAN signals (opendbc)
+
+Generic OBD-II PIDs only expose a standard subset of data. Vehicle makers
+broadcast far more on their CAN bus, described by **DBC files** — and
+[commaai/opendbc](https://github.com/commaai/opendbc) (MIT-licensed) publishes
+reverse-engineered DBCs for many platforms, including Toyota.
+
+Two tools use that data format:
+
+- **`dbc_signals`** — parse a DBC and list its messages/signals, so you can see
+  what a platform exposes beyond OBD-II.
+- **`decode_can`** — decode a raw CAN frame into physical values using the DBC
+  (little/big-endian, signed, scale/offset all handled).
+
+```bash
+# List the steering-related signals a DBC defines:
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"dbc_signals","arguments":{"dbc_path":"/path/to/opendbc/toyota_something.dbc","filter":"steer"}}}' \
+  | target/release/obd-mcp
+```
+
+**Scope / limitation:** these tools do the *data-format* half — parsing DBCs and
+decoding a frame **you provide** (e.g. captured via an ELM327 monitor mode or a
+dedicated CAN tool). The server itself speaks OBD-II request/response and does
+**not** passively sniff the CAN bus; live raw-CAN capture would be a larger
+change to the underlying transport.
+
+## Trying it without a car
+
+There are two hardware-free modes, for two different jobs.
+
+### Simulator mode (recommended)
+
+`simulate=true` runs a **coherent vehicle simulator**: a synthetic drive cycle
+where the engine warms up from cold, idles, accelerates, cruises and
+decelerates on a loop, and every sensor is derived from that shared state — so
+RPM tracks speed and gear, MAF tracks RPM and load, MAP tracks throttle, and
+the coolant climbs smoothly to operating temperature. Poll `read_live_data`
+repeatedly and you get a believable, evolving picture rather than random noise.
+
+It can also inject a **fault scenario** via the `scenario` argument, which skews
+the relevant live values *and* reports a matching trouble code with the
+check-engine light on — ideal for practising a troubleshooting flow:
+
+| `scenario` | What it simulates |
+| --- | --- |
+| `healthy` (default) | Everything nominal, no codes, MIL off. |
+| `vacuum_leak` | Large positive fuel trims (lean), worst at idle. Sets `P0171`. |
+| `misfire` | RPM jitter and erratic short-term fuel trim. Sets `P0300`/`P0301`. |
+| `overheat` | Coolant climbs past the normal range into the red. Sets `P0217`. |
+
+`clear_trouble_codes` clears the fault and turns the light off, just like a real
+ECU.
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"connect","arguments":{"simulate":true,"scenario":"vacuum_leak"}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_live_data","arguments":{}}}' \
+  '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read_trouble_codes","arguments":{}}}' \
+  | target/release/obd-mcp
+```
+
+Or in Claude Code, just ask it to *"connect in simulate mode with a vacuum leak
+and help me diagnose it."*
+
+### Demo mode
+
+`demo=true` replays OBDium's **recorded sample responses**. Each read returns a
+random recorded value for that PID, so the numbers are real but not physically
+coherent between sensors or over time. It's best for exercising the raw
+protocol/decoding path rather than for a realistic drive:
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"connect","arguments":{"demo":true}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_live_data","arguments":{}}}' \
+  | target/release/obd-mcp
+```
+
+## Testing
+
+```bash
+cargo test -p obd-mcp
+```
+
+Because `obd-mcp` is its own crate, this builds only the `obdium` library and
+the server — never the Tauri app. Two layers run:
+
+- **Unit tests** (`mcp/src/main.rs`, `mcp/src/simulator.rs`) cover reading
+  serialization, JSON-RPC dispatch (initialize, `tools/list`, notifications,
+  unknown methods), tool-level error handling, and the simulator model itself
+  (readings stay in physical ranges across a drive cycle, the engine warms up,
+  idle vs. cruise is coherent, and each fault scenario skews the right values
+  and sets the right code), and the `known_issues` lookup with a **mocked HTTP
+  client** (VIN decode, recall/complaint aggregation, component filtering, and
+  per-URL caching) so it never touches the network. No hardware or data files
+  needed.
+- **Integration tests** (`mcp/tests/mcp_server.rs`) spawn the real binary and
+  drive it over stdio in demo and simulate modes. They assert that *every*
+  emitted line is valid JSON — the regression guard ensuring the library's
+  stdout debug output never leaks into the protocol stream — and check the
+  `connect` → `read_live_data` / `read_trouble_codes` flows, including that a
+  simulated `vacuum_leak` sets `P0171` and that clearing codes turns the light
+  off.
+
+## Notes
+
+- Transport is line-delimited JSON-RPC 2.0 over stdio (MCP stdio transport).
+- The `obdium` library logs debug output to stdout; the server redirects that to
+  stderr on startup so it never corrupts the protocol stream.
+- Full VIN attribute decoding (make/model/year) depends on the large VPIC
+  database used by the desktop app and is not exposed here — `read_vin` returns
+  the raw VIN read from the vehicle.

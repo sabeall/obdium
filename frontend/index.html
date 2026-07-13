@@ -322,6 +322,21 @@
         </div>
 
         <div class="form-row">
+          <div class="dropdown" id="transport-dropdown">
+            <label>TRANSPORT</label>
+            <button
+              class="dropdown-toggle"
+              id="transport-selected"
+              data-value="serial"
+            >
+              SERIAL
+            </button>
+            <ul class="dropdown-menu" id="transport-menu">
+              <li data-value="serial">SERIAL</li>
+              <li data-value="ble">BLUETOOTH LE</li>
+            </ul>
+          </div>
+
           <div class="dropdown" id="protocol-dropdown">
             <label>OBD-II PROTOCOL</label>
             <button
@@ -347,7 +362,7 @@
 
           <div class="dropdown" id="serial-port-dropdown">
             <div class="label-row">
-              <label>SERIAL PORT COM</label>
+              <label id="port-dropdown-label">SERIAL PORT COM</label>
               <button class="refresh" id="refresh-serial-ports">
                 <svg
                   xmlns="http://www.w3.org/2000/svg"
@@ -373,7 +388,11 @@
               </button>
             </div>
 
-            <button class="dropdown-toggle" id="serial-port-selected">
+            <button
+              class="dropdown-toggle"
+              id="serial-port-selected"
+              data-value="DEMO MODE"
+            >
               DEMO MODE
             </button>
             <ul class="dropdown-menu" id="serial-port-dropdown-menu">
@@ -1195,7 +1214,9 @@
     refreshButton.addEventListener("click", () => {
       refreshIcon.classList.add("spinning");
 
-      emit("get-serial-ports");
+      const transport =
+        document.getElementById("transport-selected").dataset.value;
+      emit(transport === "ble" ? "get-ble-devices" : "get-serial-ports");
     });
 
     refreshIcon.addEventListener("animationend", () => {

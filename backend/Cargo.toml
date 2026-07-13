@@ -22,8 +22,19 @@ tauri-plugin-shell = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-dialog = "2"
 
+# Optional BLE (GATT) transport. Only pulled in when the `ble` feature is enabled.
+btleplug = { version = "0.11", optional = true }
+futures = { version = "0.3", optional = true }
+uuid = { version = "1", optional = true }
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [features]
+# The desktop app ships with BLE support by default (Tauri has no config field for
+# cargo features, so this is how packaged/dev app builds pick it up). Consumers that
+# want a lean build — e.g. the MCP crate — depend with `default-features = false`.
+default = ["ble"]
 custom-protocol = ["tauri/custom-protocol"]
+# Enable the BLE adapter backend (Veepeak OBDCheck BLE, vLinker, etc.).
+ble = ["dep:btleplug", "dep:futures", "dep:uuid"]

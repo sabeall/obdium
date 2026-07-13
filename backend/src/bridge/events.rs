@@ -122,6 +122,28 @@ pub fn listen_send_ports(window: &Arc<WebviewWindow>) {
     });
 }
 
+/// Scan for nearby BLE ELM327 adapters. Emits `update-ble-devices` with `(name, id)`
+/// pairs; the `id` is what the frontend passes back as `serialPort` with `transport: "ble"`.
+/// Returns an empty list when the app is built without the `ble` feature.
+pub fn listen_send_ble_devices(window: &Arc<WebviewWindow>) {
+    let window_arc = Arc::new(window.clone());
+    let window_clone = Arc::clone(&window_arc);
+    window_clone.listen("get-ble-devices", move |_| {
+        println!("scanning for ble devices!");
+        let _ = window_arc.emit("update-ble-devices", scan_ble_devices());
+    });
+}
+
+#[cfg(feature = "ble")]
+fn scan_ble_devices() -> Vec<(String, String)> {
+    obdium::transport::scan_ble_adapters(false)
+}
+
+#[cfg(not(feature = "ble"))]
+fn scan_ble_devices() -> Vec<(String, String)> {
+    Vec::new()
+}
+
 // TODO: This is an eye sore.
 pub fn listen_decode_vin(window: &WebviewWindow) {
     let window_arc = Arc::new(window.clone());
@@ -219,6 +241,7 @@ pub fn listen_connect_elm(window: &Arc<WebviewWindow>) {
 
         let obd = connect_obd(
             &window_arc,
+            connect_payload.transport,
             connect_payload.serial_port,
             connect_payload.baud_rate,
             connect_payload.protocol,

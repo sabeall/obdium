@@ -1,4 +1,3 @@
-use serialport::SerialPort;
 use sqlite::State;
 use std::collections::HashMap;
 use std::fmt;
@@ -10,6 +9,7 @@ use std::time::Duration;
 use crate::cmd::{Command, CommandType};
 use crate::response::Response;
 use crate::scalar::{Scalar, Unit, UnitPreferences};
+use crate::transport::{DummyTransport, SerialTransport, Transport};
 use crate::vin::VIN;
 use crate::MODE22_PIDS_DB_PATH;
 
@@ -75,109 +75,9 @@ pub enum Service {
     Mode22,
 }
 
-// Fake serial port used for simulating.
-// Specifically demo mode.
-struct DummySerialPort;
-
-impl SerialPort for DummySerialPort {
-    fn name(&self) -> Option<String> {
-        Some("DEMO MODE".to_string())
-    }
-    fn baud_rate(&self) -> serialport::Result<u32> {
-        Ok(0)
-    }
-    fn data_bits(&self) -> serialport::Result<serialport::DataBits> {
-        Ok(serialport::DataBits::Eight)
-    }
-    fn flow_control(&self) -> serialport::Result<serialport::FlowControl> {
-        Ok(serialport::FlowControl::None)
-    }
-    fn parity(&self) -> serialport::Result<serialport::Parity> {
-        Ok(serialport::Parity::None)
-    }
-    fn stop_bits(&self) -> serialport::Result<serialport::StopBits> {
-        Ok(serialport::StopBits::One)
-    }
-    fn timeout(&self) -> Duration {
-        Duration::from_secs(0)
-    }
-    fn set_timeout(&mut self, _timeout: Duration) -> serialport::Result<()> {
-        Ok(())
-    }
-    fn write_request_to_send(&mut self, _level: bool) -> serialport::Result<()> {
-        Ok(())
-    }
-    fn write_data_terminal_ready(&mut self, _level: bool) -> serialport::Result<()> {
-        Ok(())
-    }
-    fn read_clear_to_send(&mut self) -> serialport::Result<bool> {
-        Ok(true)
-    }
-    fn read_data_set_ready(&mut self) -> serialport::Result<bool> {
-        Ok(true)
-    }
-    fn read_ring_indicator(&mut self) -> serialport::Result<bool> {
-        Ok(false)
-    }
-    fn read_carrier_detect(&mut self) -> serialport::Result<bool> {
-        Ok(false)
-    }
-    fn bytes_to_read(&self) -> serialport::Result<u32> {
-        Ok(0)
-    }
-    fn bytes_to_write(&self) -> serialport::Result<u32> {
-        Ok(0)
-    }
-    fn clear(&self, _buffer: serialport::ClearBuffer) -> serialport::Result<()> {
-        Ok(())
-    }
-    fn try_clone(&self) -> serialport::Result<Box<dyn SerialPort>> {
-        Ok(Box::new(DummySerialPort))
-    }
-    fn set_baud_rate(&mut self, _baud_rate: u32) -> serialport::Result<()> {
-        Ok(())
-    }
-    fn set_data_bits(&mut self, _data_bits: serialport::DataBits) -> serialport::Result<()> {
-        Ok(())
-    }
-    fn set_flow_control(
-        &mut self,
-        _flow_control: serialport::FlowControl,
-    ) -> serialport::Result<()> {
-        Ok(())
-    }
-    fn set_parity(&mut self, _parity: serialport::Parity) -> serialport::Result<()> {
-        Ok(())
-    }
-    fn set_stop_bits(&mut self, _stop_bits: serialport::StopBits) -> serialport::Result<()> {
-        Ok(())
-    }
-    fn set_break(&self) -> serialport::Result<()> {
-        Ok(())
-    }
-    fn clear_break(&self) -> serialport::Result<()> {
-        Ok(())
-    }
-}
-
-impl Read for DummySerialPort {
-    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-        Ok(0)
-    }
-}
-
-impl Write for DummySerialPort {
-    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-        Ok(0)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 #[derive(Default)]
 pub struct OBD {
-    connection: Option<Box<dyn SerialPort>>,
+    connection: Option<Box<dyn Transport>>,
     elm_version: Option<String>,
     freeze_frame_query: bool,
     protocol: u8,
@@ -197,11 +97,13 @@ impl OBD {
         }
     }
 
+    /// Connect over a serial port (the default backend). Passing `"DEMO MODE"` starts
+    /// replay mode without any hardware.
     pub fn connect(&mut self, port: &str, baud_rate: u32, protocol: u8) -> Result<(), Error> {
         if port == "DEMO MODE" {
             // No connection required
             self.replay_requests = true;
-            self.connection = Some(Box::new(DummySerialPort));
+            self.connection = Some(Box::new(DummyTransport));
 
             return Ok(());
         }
@@ -213,34 +115,66 @@ impl OBD {
             return Ok(());
         }
 
-        self.connection = serialport::new(port, baud_rate)
-            .timeout(Duration::from_secs(1))
-            .open()
-            .ok();
+        self.connection = SerialTransport::open(port, baud_rate)
+            .map(|transport| Box::new(transport) as Box<dyn Transport>);
 
-        if self.is_connected() {
-            let initialized = self.init();
-            let mut command = match protocol {
-                0 => Command::new_at(b"ATSP0"),
-                1 => Command::new_at(b"ATSP1"),
-                2 => Command::new_at(b"ATSP2"),
-                3 => Command::new_at(b"ATSP3"),
-                4 => Command::new_at(b"ATSP4"),
-                5 => Command::new_at(b"ATSP5"),
-                6 => Command::new_at(b"ATSP6"),
-                7 => Command::new_at(b"ATSP7"),
-                8 => Command::new_at(b"ATSP8"),
-                9 => Command::new_at(b"ATSP9"),
-                _ => return Err(Error::InitFailed),
-            };
+        self.negotiate(protocol)
+    }
 
-            self.send_command(&mut command)?;
-            self.protocol = protocol;
+    /// Connect over BLE (GATT). `identifier` matches a peripheral by advertised name
+    /// substring (case-insensitive) or peripheral id — e.g. `"OBDBLE"` / `"Veepeak"`.
+    ///
+    /// This is an *additive, opt-in* backend; the serial path above stays the default.
+    /// Requires the `ble` cargo feature.
+    #[cfg(feature = "ble")]
+    pub fn connect_ble(&mut self, identifier: &str, protocol: u8) -> Result<(), Error> {
+        self.replay_requests = false;
+        self.record_requests = false;
 
-            initialized
-        } else {
-            Err(Error::ConnectionFailed)
+        if self.connection.is_some() {
+            return Ok(());
         }
+
+        self.connection = crate::transport::BleTransport::connect(identifier)
+            .ok()
+            .map(|transport| Box::new(transport) as Box<dyn Transport>);
+
+        self.negotiate(protocol)
+    }
+
+    /// Shared post-connection handshake: initialize the ELM327 and select the protocol.
+    /// Used by every transport once its byte pipe is open.
+    fn negotiate(&mut self, protocol: u8) -> Result<(), Error> {
+        if !self.is_connected() {
+            return Err(Error::ConnectionFailed);
+        }
+
+        let initialized = self.init();
+        let mut command = match protocol {
+            0 => Command::new_at(b"ATSP0"),
+            1 => Command::new_at(b"ATSP1"),
+            2 => Command::new_at(b"ATSP2"),
+            3 => Command::new_at(b"ATSP3"),
+            4 => Command::new_at(b"ATSP4"),
+            5 => Command::new_at(b"ATSP5"),
+            6 => Command::new_at(b"ATSP6"),
+            7 => Command::new_at(b"ATSP7"),
+            8 => Command::new_at(b"ATSP8"),
+            9 => Command::new_at(b"ATSP9"),
+            _ => return Err(Error::InitFailed),
+        };
+
+        self.send_command(&mut command)?;
+        self.protocol = protocol;
+
+        // Read and discard the ATSPx response. Otherwise it lingers unread in
+        // the transport pipe and can be misread as the response to whatever
+        // command runs next — especially over BLE, where notification
+        // delivery is asynchronous and a same-instant `clear()` can't flush
+        // bytes that haven't arrived yet.
+        let _ = self.read_until(b'>');
+
+        initialized
     }
 
     pub fn disconnect(&mut self) {
@@ -263,7 +197,7 @@ impl OBD {
 
     pub fn serial_port_baud_rate(&self) -> Option<u32> {
         match &self.connection {
-            Some(connection) => connection.baud_rate().ok(),
+            Some(connection) => connection.baud_rate(),
             None => None,
         }
     }
@@ -449,8 +383,8 @@ impl OBD {
             None => return Err(Error::NoConnection),
         };
 
-        let _ = stream.set_timeout(Duration::from_secs(1));
-        let _ = stream.clear(serialport::ClearBuffer::All);
+        stream.set_timeout(Duration::from_secs(1));
+        stream.clear();
 
         let mut cmd = req.as_bytes();
         if cmd.is_empty() {
@@ -673,8 +607,7 @@ impl OBD {
             None => return Err(Error::NoConnection),
         };
 
-        port.clear(serialport::ClearBuffer::All)
-            .map_err(|_| Error::ELM327ReadError)?;
+        port.clear();
 
         let mut buffer = [0u8; 1];
         let mut response = String::new();

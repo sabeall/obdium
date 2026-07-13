@@ -66,7 +66,7 @@ export async function exportDtcs(autoSave) {
   await writeFile({ path, contents: JSON.stringify(totalJSON, null, 2) });
 }
 
-export async function connectElm(baudRate, serialPort, protocol) {
+export async function connectElm(baudRate, serialPort, protocol, transport = "serial") {
   if (window.connected) {
     return;
   }
@@ -76,8 +76,9 @@ export async function connectElm(baudRate, serialPort, protocol) {
   connectButton.disabled = true;
   emit("connect-elm", {
     serialPort: serialPort,
-    baudRate: parseInt(baudRate),
+    baudRate: parseInt(baudRate) || 0,
     protocol: parseInt(protocol),
+    transport: transport,
   });
 }
 
